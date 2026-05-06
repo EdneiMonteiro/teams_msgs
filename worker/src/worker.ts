@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
+// See LICENSE and DISCLAIMER.md in the project root for details.
 import { ServiceBusClient, ServiceBusReceivedMessage, ProcessErrorArgs } from "@azure/service-bus";
 import { BotFrameworkAdapter, ConversationReference, TurnContext } from "botbuilder";
 import { incrementJobProgress } from "./job-tracker";

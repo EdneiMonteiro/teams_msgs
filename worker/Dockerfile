@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
+# See LICENSE and DISCLAIMER.md in the project root for details.
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./

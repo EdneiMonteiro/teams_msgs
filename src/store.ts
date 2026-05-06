@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
+// See LICENSE and DISCLAIMER.md in the project root for details.
 import { ConversationReference } from "botbuilder";
 import * as fs from "fs";
 import * as path from "path";
