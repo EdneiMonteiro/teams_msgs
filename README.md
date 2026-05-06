@@ -67,7 +67,7 @@ Leia também:
 
 ```mermaid
 graph LR
-    A[Aplicação Cliente] -->|POST /api/send| B[API Server<br/>App Service]
+    A[Aplicação Cliente] -->|POST /api/send| B[API Server<br/>Container Apps]
     B -->|Salva refs| C[(Table Storage<br/>conversationrefs)]
     B -->|Enfileira N msgs| D[Service Bus<br/>Queue]
     D -->|KEDA trigger| E[ACA Worker<br/>0-10 réplicas]
@@ -89,10 +89,14 @@ graph TB
         U2[👤 Usuário recebe mensagem]
     end
 
-    subgraph "API Server — App Service"
-        API[Express Server :3978]
+    subgraph "ACA Environment"
+        API[API Server :3978<br/>minReplicas: 1<br/>ingress: external]
         BOT[ProactiveBot<br/>ActivityHandler]
         ENQ[Message Enqueuer]
+        K[KEDA Scaler<br/>messageCount ≥ 5]
+        W1[Worker 1]
+        W2[Worker 2]
+        WN[Worker N<br/>minReplicas: 0]
     end
 
     subgraph "Armazenamento"
@@ -102,13 +106,6 @@ graph TB
 
     subgraph "Fila de Mensagens"
         SB[Azure Service Bus<br/>Queue: send-messages<br/>Dead-letter habilitado]
-    end
-
-    subgraph "Workers — ACA + KEDA"
-        K[KEDA Scaler<br/>messageCount ≥ 5 → scale up]
-        W1[Worker 1]
-        W2[Worker 2]
-        WN[Worker N]
     end
 
     subgraph "Microsoft"
@@ -240,14 +237,14 @@ flowchart TD
 |---------|-----|-----------|----------------|
 | **App Registration** | Gratuito | Identidade do bot (SingleTenant) | Grátis |
 | **Azure Bot** | F0 (Gratuito) | Registro no Bot Framework + canal Teams | Grátis |
-| **App Service** | B1 | Servidor da API (recebe eventos, enfileira jobs) | ~US$ 13/mês |
+| **Container Apps** | Consumption | API Server (minReplicas: 1, ingress externo) | ~US$ 5/mês |
+| **Container Apps** | Consumption | Workers KEDA (scale-to-zero, 0-10 réplicas) | Pay-per-use |
 | **Service Bus** | Basic | Fila de mensagens com dead-letter e retry | ~US$ 0,05/mês |
 | **Storage Account** | Standard LRS | Table Storage para refs e tracking de jobs | ~US$ 1/mês |
-| **Container Registry** | Basic | Imagens Docker do worker | ~US$ 5/mês |
-| **Container Apps** | Consumption | Workers com KEDA (scale-to-zero) | Pay-per-use |
+| **Container Registry** | Basic | Imagens Docker (API + worker) | ~US$ 5/mês |
 | **Log Analytics** | Pay-per-GB | Logs do ACA (configure daily cap) | ~US$ 2/mês |
 
-> 💡 **Custo total estimado**: ~US$ 20-25/mês em repouso. Workers geram custo apenas quando estão enviando.
+> 💡 **Custo total estimado**: ~US$ 13-15/mês em repouso. Workers geram custo apenas quando estão enviando. Tudo roda no mesmo ACA Environment.
 
 ---
 
@@ -289,13 +286,15 @@ flowchart TD
 ```
 teams-proactive-messaging/
 │
-├── src/                        # API Server (App Service)
+├── src/                        # API Server (Container Apps)
 │   ├── index.ts                # Servidor Express + endpoints REST
 │   ├── bot.ts                  # ProactiveBot — captura conversationReferences
 │   ├── table-store.ts          # Client Azure Table Storage (refs + jobs)
 │   ├── sender.ts               # Sender síncrono (para uso em pequena escala)
 │   ├── send-bulk.ts            # Ferramenta CLI para envio direto
 │   └── store.ts                # Store em arquivo JSON (dev/teste)
+├── Dockerfile                  # Dockerfile da API
+├── .dockerignore
 │
 ├── worker/                     # ACA Worker (Container Apps)
 │   ├── src/
@@ -368,43 +367,66 @@ ngrok http 3978
 
 ### 4. Deploy
 
-#### API → App Service
+Todos os componentes rodam no mesmo **ACA Environment**:
+
+#### Criar infraestrutura
 
 ```bash
-az webapp up --resource-group <rg> --name <app-name> --runtime "NODE:20-lts"
+# Resource group + Service Bus + Storage + ACR
+az group create --name rg-teams-msgs --location eastus2
+az servicebus namespace create --resource-group rg-teams-msgs --name sb-my-msgs --sku Basic
+az servicebus queue create --resource-group rg-teams-msgs --namespace-name sb-my-msgs \
+  --name send-messages --max-delivery-count 5
+az storage account create --resource-group rg-teams-msgs --name stmymsgs --sku Standard_LRS
+az acr create --resource-group rg-teams-msgs --name acrmymsgs --sku Basic --admin-enabled true
 
-az bot update --resource-group <rg> --name <bot-name> \
-  --endpoint "https://<app-name>.azurewebsites.net/api/messages"
+# ACA Environment (compartilhado)
+az containerapp env create --resource-group rg-teams-msgs --name aca-env --location eastus2
 ```
 
-#### Worker → Container Apps
+#### API → Container Apps (ingress externo, always-on)
+
+```bash
+# Build imagem da API
+az acr build --registry acrmymsgs --image teams-msgs-api:v1 --file Dockerfile .
+
+# Deploy com ingress externo
+az containerapp create \
+  --resource-group rg-teams-msgs \
+  --name api-msgs \
+  --environment aca-env \
+  --image acrmymsgs.azurecr.io/teams-msgs-api:v1 \
+  --min-replicas 1 --max-replicas 3 \
+  --ingress external --target-port 3978 \
+  --env-vars "MICROSOFT_APP_ID=<app-id>" \
+             "MICROSOFT_APP_TENANT_ID=<tenant-id>" \
+             "PORT=3978"
+  # + secrets para SERVICE_BUS_CONNECTION, STORAGE_CONNECTION, MICROSOFT_APP_PASSWORD
+
+# Atualizar messaging endpoint no bot
+az bot update --resource-group rg-teams-msgs --name my-bot \
+  --endpoint "https://<api-fqdn>/api/messages"
+```
+
+#### Worker → Container Apps (KEDA, scale-to-zero)
 
 ```bash
 cd worker
 
-# Build da imagem via ACR
-az acr build --registry <acr> --image teams-msgs-worker:v1 --file Dockerfile .
+# Build imagem do worker
+az acr build --registry acrmymsgs --image teams-msgs-worker:v1 --file Dockerfile .
 
-# Deploy no ACA com KEDA
+# Deploy com KEDA Service Bus scaler
 az containerapp create \
-  --resource-group <rg> \
-  --name <worker-name> \
-  --environment <aca-env> \
-  --image <acr>.azurecr.io/teams-msgs-worker:v1 \
+  --resource-group rg-teams-msgs \
+  --name worker-msgs \
+  --environment aca-env \
+  --image acrmymsgs.azurecr.io/teams-msgs-worker:v1 \
   --min-replicas 0 --max-replicas 10 \
-  --secrets "sb-conn=<service-bus-connection>" \
-            "st-conn=<storage-connection>" \
-            "bot-pass=<app-password>" \
-  --env-vars "SERVICE_BUS_CONNECTION=secretref:sb-conn" \
-             "STORAGE_CONNECTION=secretref:st-conn" \
-             "MICROSOFT_APP_ID=<app-id>" \
-             "MICROSOFT_APP_PASSWORD=secretref:bot-pass" \
+  --env-vars "MICROSOFT_APP_ID=<app-id>" \
              "MICROSOFT_APP_TENANT_ID=<tenant-id>" \
-             "MAX_CONCURRENT=10" \
-  --scale-rule-name sb-queue \
-  --scale-rule-type azure-servicebus \
-  --scale-rule-metadata "queueName=send-messages" "messageCount=5" \
-  --scale-rule-auth "connection=sb-conn"
+             "MAX_CONCURRENT=10"
+  # + secrets + scale-rule-* (ver seção Escalabilidade)
 ```
 
 ---
@@ -485,7 +507,7 @@ Abra `manifest/manifest.json` e substitua os placeholders:
 | Placeholder | Substituir por |
 |------------|----------------|
 | `<MICROSOFT_APP_ID>` | Client ID do seu App Registration |
-| `<your-app-service>` | Hostname do App Service (ex: `meu-app.azurewebsites.net`) |
+| `<your-app-service>` | FQDN do ACA API (ex: `api-msgs.gentledune-xxx.eastus2.azurecontainerapps.io`) |
 
 ### 2. Empacote o app
 
@@ -568,7 +590,7 @@ node load_test/run.js --requests 100 --concurrency 10 --delay 500
 ### Teste assíncrono (via fila — arquitetura de produção)
 
 ```bash
-BOT_URL=https://<seu-app>.azurewebsites.net node load_test/run-async.js --jobs 100
+BOT_URL=https://<seu-app-fqdn> node load_test/run-async.js --jobs 100
 ```
 
 Ambos os scripts exibem:
