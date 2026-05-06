@@ -1,0 +1,19 @@
+{
+  "name": "teams-msgs-worker",
+  "version": "1.0.0",
+  "description": "ACA Worker - consome Service Bus e envia mensagens Teams via Bot Framework",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@azure/data-tables": "^13.2.0",
+    "@azure/service-bus": "^7.9.0",
+    "botbuilder": "^4.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  }
+}

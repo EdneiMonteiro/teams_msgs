@@ -1,0 +1,40 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "<MICROSOFT_APP_ID>",
+  "developer": {
+    "name": "Your Company",
+    "websiteUrl": "https://<your-app-service>.azurewebsites.net",
+    "privacyUrl": "https://<your-app-service>.azurewebsites.net/privacy",
+    "termsOfUseUrl": "https://<your-app-service>.azurewebsites.net/terms"
+  },
+  "name": {
+    "short": "Notifications",
+    "full": "Proactive Notifications System"
+  },
+  "description": {
+    "short": "Receive notifications and announcements from your organization",
+    "full": "Bot for sending bulk notifications and announcements to organization members via 1:1 chat in Microsoft Teams."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#0078D4",
+  "bots": [
+    {
+      "botId": "<MICROSOFT_APP_ID>",
+      "scopes": ["personal"],
+      "supportsFiles": false,
+      "isNotificationOnly": true,
+      "commandLists": []
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": [
+    "<your-app-service>.azurewebsites.net"
+  ],
+  "defaultInstallScope": "personal",
+  "defaultGroupCapability": {}
+}

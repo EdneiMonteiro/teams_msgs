@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+*.zip
+*.log
+load_test/report*.json
+.azure/
+data/
