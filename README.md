@@ -23,13 +23,13 @@ Demo de referência para **envio de mensagens proativas 1:1 em massa via Microso
 
 ## Por que essa arquitetura?
 
-Em cenários reais de comunicação corporativa em massa via Teams (10k–100k+ usuários), as alternativas comumente tentadas têm limitações:
+Em cenários reais de comunicação corporativa em massa via Teams (10k–100k+ usuários), as alternativas comumente tentadas têm comportamentos diferentes:
 
-| Abordagem | Limitação |
+| Abordagem | Realidade |
 |---|---|
-| **Power Automate / Power Platform** | Throttling agressivo (~6k chamadas/dia por conexão), custo por execução, latência alta em massa. |
-| **Microsoft Graph (chats / messages)** | Limites por app e por usuário, criação de chat 1:1 é cara, geralmente pensada para uso interativo. |
-| **Bot Framework — proactive messaging** | Canal **projetado** para esse caso. ~50 msg/s sustentado por bot, com fan-out por workers. |
+| **Power Automate** | Limites por licença e conector, não projetado para processamento massivo; pode sofrer throttling e latência. |
+| **Microsoft Graph** | Possui throttling multi-nível (app, tenant, user); adequado para integração, não para broadcast massivo. |
+| **Bot Framework** | Canal nativo para notificações e proactive messaging; melhor suporte para escala, com rate limits dinâmicos. |
 
 Esta demo **não burla rate limits** — usa o canal certo. O envio depende do Teams App estar instalado para cada usuário (org-wide via Admin Center), o que faz o bot capturar uma `conversationReference` por usuário e usá-la depois para mandar mensagens 1:1 sem nova interação.
 
