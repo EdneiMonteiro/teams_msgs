@@ -185,19 +185,31 @@ POST /api/send
 Content-Type: application/json
 x-api-key: <API_KEY>
 
-{ "message": "📢 Comunicado importante para todos os colaboradores!" }
+{
+  "message": "📢 Comunicado importante para todos os colaboradores!",
+  "repeat": 1
+}
 ```
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `message` | string | sim | Texto enviado a cada usuário |
+| `repeat` | int | não | Cópias por usuário (default `1`, máx `100000`). Útil para testes de stress / broadcast em rajada |
 
 ```json
 HTTP/1.1 202 Accepted
 {
   "jobId": "d836...",
+  "refs": 50000,
+  "repeat": 1,
   "total": 50000,
   "enqueued": 50000,
   "status": "queued",
   "statusUrl": "/api/jobs/d836..."
 }
 ```
+
+> ⚠️ **`repeat` multiplica `refs × repeat`** mensagens reais para o Bot Framework. Use com cuidado em produção — útil principalmente para load testing.
 
 ### `GET /api/jobs/:id`
 
@@ -372,28 +384,29 @@ az containerapp create -g $RG -n worker-teams-msgs \
 
 Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic. Cada job dispara N mensagens 1:1 a partir de 1 POST.
 
-### Resultado de referência — single-job 50K (versão atual, v6)
+### Resultado de referência — single-job 50K (versão atual, v7)
 
 | Métrica | Valor |
 |---|---|
 | Total de mensagens | **50.002** |
 | Enviadas | **50.002** (100%) |
 | Falhas | **0** |
-| Tempo de enqueue (Service Bus) | **64.2s** |
-| Tempo de processamento | **70.1s** |
-| Tempo total | **134.3s** (~2 min 14 s) |
-| **Throughput sustentado** | **42.821 msg/min** (~714 msg/s) |
+| Tempo de enqueue (Service Bus) | **63.8s** |
+| Tempo de processamento | **80.9s** |
+| Tempo total | **144.6s** (~2 min 25 s) |
+| **Throughput sustentado** | **37.089 msg/min** (~618 msg/s) |
 
 > Relatório bruto: `load_test/report-50k.json`. Reproduza com:
 > `node load_test/run-50k.js --refs 50000` (precisa de `BOT_URL`, `API_KEY` e `STORAGE_CONNECTION` no env).
 
 ### Histórico de evolução (mesmo cenário — 50K refs)
 
-| Versão | Arquitetura | Throughput | Falhas | Observação |
+| Versão | Mudança principal | Throughput | Falhas | Observação |
 |---|---|---:|---:|---|
 | v1 (POC) | Cosmos DB + ETag retries | — | travado em 71% | Race condition em writes concorrentes |
 | v3 | Redis (counters) + Table Storage (refs/jobs) | 30.976 msg/min | 0 | Job tracking no Redis resolve race condition |
-| **v6 (atual)** | **Redis (counters + refs index + msg cache) + Table Storage (refs)** | **42.821 msg/min** | **0** | Mensagem cacheada no Redis, payload SB menor, hash do messageId |
+| v6 | Redis (counters + refs index + msg cache) + Table Storage (refs only) | 42.821 msg/min | 0 | Mensagem cacheada no Redis, payload SB menor, hash do messageId |
+| **v7 (atual)** | Param `repeat` no `/api/send` para broadcast em rajada | **37.089 msg/min** | **0** | Variância natural entre runs (Bot Framework + SB Basic compartilhados) |
 
 ### Waves (volume crescente)
 

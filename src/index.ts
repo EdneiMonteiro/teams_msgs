@@ -106,10 +106,13 @@ function requireApiKey(req: Request, res: Response, next: NextFunction): void {
 // --- POST /api/send (assíncrono) ---
 
 app.post("/api/send", requireApiKey, async (req: Request, res: Response) => {
-  const { message } = req.body || {};
+  const { message, repeat } = req.body || {};
   if (!message || typeof message !== "string") {
     return res.status(400).json({ error: "Campo 'message' (string) é obrigatório" });
   }
+  // repeat: número de cópias por usuário (default 1; cap 100k para segurança)
+  const repeatCount = Math.max(1, Math.min(parseInt(String(repeat || 1), 10) || 1, 100000));
+
   if (!sbClient) {
     return res.status(503).json({ error: "SERVICE_BUS_CONNECTION não configurada" });
   }
@@ -129,30 +132,30 @@ app.post("/api/send", requireApiKey, async (req: Request, res: Response) => {
   }
 
   const jobId = uuidv4();
-  await createJob(jobId, message, refs.length);
+  const totalMessages = refs.length * repeatCount;
+  await createJob(jobId, message, totalMessages);
 
   const sender = sbClient.createSender(QUEUE_NAME);
   let enqueued = 0;
   try {
     let batch = await sender.createMessageBatch();
     for (const ref of refs) {
-      const sbMessage: ServiceBusMessage = {
-        body: { jobId, refJson: ref.refJson, rowKey: ref.rowKey },
-        contentType: "application/json",
-        // Idempotência: ServiceBus Standard/Premium usam para deduplicar.
-        // Em Basic não tem efeito, mas é uma boa prática manter.
-        // SB limita messageId a 128 chars; usamos hash do rowKey (32 hex).
-        messageId: `${jobId}:${createHash("md5").update(ref.rowKey).digest("hex")}`,
-      };
-      if (!batch.tryAddMessage(sbMessage)) {
-        // Batch cheio → envia o atual e cria um novo
-        await sender.sendMessages(batch);
-        enqueued += batch.count;
-        batch = await sender.createMessageBatch();
+      const refHash = createHash("md5").update(ref.rowKey).digest("hex");
+      for (let r = 0; r < repeatCount; r++) {
+        const sbMessage: ServiceBusMessage = {
+          body: { jobId, refJson: ref.refJson, rowKey: ref.rowKey },
+          contentType: "application/json",
+          // SB limita messageId a 128 chars; jobId(36) + ":" + md5(32) + ":" + r ≤ 80 chars
+          messageId: `${jobId}:${refHash}:${r}`,
+        };
         if (!batch.tryAddMessage(sbMessage)) {
-          // Mensagem maior que o batch limit (não deveria acontecer)
-          console.warn(`[SEND] Mensagem ${ref.rowKey} excede limite do batch`);
-          continue;
+          await sender.sendMessages(batch);
+          enqueued += batch.count;
+          batch = await sender.createMessageBatch();
+          if (!batch.tryAddMessage(sbMessage)) {
+            console.warn(`[SEND] Mensagem ${ref.rowKey}#${r} excede limite do batch`);
+            continue;
+          }
         }
       }
     }
@@ -165,11 +168,15 @@ app.post("/api/send", requireApiKey, async (req: Request, res: Response) => {
   }
 
   await setJobStatus(jobId, "processing");
-  console.log(`🚀 Job ${jobId}: ${enqueued}/${refs.length} mensagens enfileiradas`);
+  console.log(
+    `🚀 Job ${jobId}: ${enqueued}/${totalMessages} mensagens enfileiradas (refs=${refs.length}, repeat=${repeatCount})`
+  );
 
   res.status(202).json({
     jobId,
-    total: refs.length,
+    refs: refs.length,
+    repeat: repeatCount,
+    total: totalMessages,
     enqueued,
     status: "queued",
     statusUrl: `/api/jobs/${jobId}`,
