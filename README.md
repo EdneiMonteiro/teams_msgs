@@ -2,7 +2,7 @@
 
 Demo de referência para **envio de mensagens proativas 1:1 em massa via Microsoft Teams** — validada com carga de até **50.000 mensagens** e desenhada para respeitar rate limits do Power Platform, Graph API e Bot Framework.
 
-> ⚠️ Este repositório é **demo / prova de conceito**. Antes de usar em produção, revise: segurança, escalabilidade, observabilidade, custos e conformidade. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [SUPPORT.md](./SUPPORT.md).
+> ⚠️ Este repositório é uma **demo / prova de conceito**. Antes de usar em produção, revise: segurança, escalabilidade, observabilidade, custos e conformidade. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [SUPPORT.md](./SUPPORT.md).
 
 ---
 
