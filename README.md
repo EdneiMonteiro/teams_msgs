@@ -162,7 +162,7 @@ sequenceDiagram
         API-->>Teams: 200 OK
     end
 
-    Note over Store: 40.000 conversation<br/>references armazenadas
+    Note over Store: N conversation<br/>references armazenadas
 ```
 
 ### Fase 2 — Envio de Mensagens
@@ -181,10 +181,10 @@ sequenceDiagram
 
     Client->>API: POST /api/send<br/>{"message": "..."}
     API->>Store: Carrega todas as refs
-    Store-->>API: 40.000 refs
+    Store-->>API: N refs
     API->>Store: Cria registro do job
-    API->>SB: Enfileira 40.000 mensagens<br/>(batches de 250)
-    API-->>Client: 202 {"jobId": "abc-123",<br/>"total": 40000, "status": "queued"}
+    API->>SB: Enfileira N mensagens<br/>(batches de 250)
+    API-->>Client: 202 {"jobId": "abc-123",<br/>"total": N, "status": "queued"}
 
     Note over SB,Worker: KEDA detecta profundidade da fila<br/>→ escala workers de 0 → 10
 
@@ -452,7 +452,7 @@ Envia uma mensagem para todos os usuários registrados. Retorna imediatamente co
 ```json
 {
   "jobId": "d83627e6-b79c-4dd3-b311-52b2855d2dee",
-  "total": 40000,
+  "total": 5000,
   "status": "queued",
   "statusUrl": "/api/jobs/d83627e6-b79c-4dd3-b311-52b2855d2dee"
 }
@@ -467,8 +467,8 @@ Consulta o progresso de um job de envio em tempo real.
 {
   "jobId": "d83627e6-b79c-4dd3-b311-52b2855d2dee",
   "status": "processing",
-  "total": 40000,
-  "sent": 35200,
+  "total": 5000,
+  "sent": 4800,
   "failed": 12,
   "progress": 88,
   "createdAt": "2026-05-06T20:22:12.921Z",
@@ -490,7 +490,7 @@ Health check do serviço e contagem de usuários.
 **Response:**
 ```json
 {
-  "registeredUsers": 40000,
+  "registeredUsers": 5000,
   "status": "running",
   "mode": "queue"
 }
@@ -555,20 +555,32 @@ graph LR
     end
 
     subgraph "Carga alta"
-        Q3[Service Bus<br/>40.000 mensagens] --> W3[Workers: 10<br/>🔥 Throughput máximo]
+        Q3[Service Bus<br/>N mensagens] --> W3[Workers: 10<br/>🔥 Throughput máximo]
     end
 ```
 
 ### Benchmarks de Performance
 
-| Workers | Throughput | Tempo para 40K usuários |
-|---------|-----------|------------------------|
-| 1 | ~350 msg/min | ~2 horas |
-| 3 | ~1.000 msg/min | ~40 min |
-| 5 | ~1.700 msg/min | ~24 min |
-| 10 | ~3.000 msg/min | **~13 min** |
+Resultados obtidos em testes de carga com 1 worker (ACA, 0.5 vCPU, 1Gi):
+
+| Teste | Mensagens | Falhas | Throughput |
+|-------|-----------|--------|------------|
+| Síncrono | 1.000 | 0 | ~43 msg/min |
+| Assíncrono (Service Bus) | 100 | 0 | ~578 msg/min |
+| Assíncrono (Service Bus) | 1.000 | 0 | ~338 msg/min |
+
+Projeção teórica de escalabilidade com múltiplos workers:
+
+| Workers | Throughput estimado |
+|---------|-------------------|
+| 1 | ~350 msg/min |
+| 3 | ~1.000 msg/min |
+| 5 | ~1.700 msg/min |
+| 10 | ~3.000 msg/min |
 
 > ⚠️ **Limite do Bot Framework**: ~50 msg/s por bot antes de throttling pesado. Com 10 workers a ~50 msg/s no total, você fica dentro dos limites seguros.
+>
+> 📌 As projeções para múltiplos workers são teóricas e devem ser validadas com testes de carga no seu ambiente.
 
 ### Variáveis de Configuração
 
