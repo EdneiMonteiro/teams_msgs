@@ -370,7 +370,32 @@ az containerapp create -g $RG -n worker-teams-msgs \
 
 ## Benchmarks
 
-Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic.
+Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic. Cada job dispara N mensagens 1:1 a partir de 1 POST.
+
+### Resultado de referência — single-job 50K (versão atual, v6)
+
+| Métrica | Valor |
+|---|---|
+| Total de mensagens | **50.002** |
+| Enviadas | **50.002** (100%) |
+| Falhas | **0** |
+| Tempo de enqueue (Service Bus) | **64.2s** |
+| Tempo de processamento | **70.1s** |
+| Tempo total | **134.3s** (~2 min 14 s) |
+| **Throughput sustentado** | **42.821 msg/min** (~714 msg/s) |
+
+> Relatório bruto: `load_test/report-50k.json`. Reproduza com:
+> `node load_test/run-50k.js --refs 50000` (precisa de `BOT_URL`, `API_KEY` e `STORAGE_CONNECTION` no env).
+
+### Histórico de evolução (mesmo cenário — 50K refs)
+
+| Versão | Arquitetura | Throughput | Falhas | Observação |
+|---|---|---:|---:|---|
+| v1 (POC) | Cosmos DB + ETag retries | — | travado em 71% | Race condition em writes concorrentes |
+| v3 | Redis (counters) + Table Storage (refs/jobs) | 30.976 msg/min | 0 | Job tracking no Redis resolve race condition |
+| **v6 (atual)** | **Redis (counters + refs index + msg cache) + Table Storage (refs)** | **42.821 msg/min** | **0** | Mensagem cacheada no Redis, payload SB menor, hash do messageId |
+
+### Waves (volume crescente)
 
 | Refs | Total Msgs | Sent | Failed | Enqueue | Processing | Throughput |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -378,12 +403,11 @@ Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table St
 | 1.000 | 1.002 | 1.002 | 0 | 0.7s | 3.2s | 18.953 msg/min |
 | 10.000 | 10.002 | 10.002 | 0 | 16.5s | 12.9s | 46.481 msg/min |
 | 15.000 | 15.002 | 15.002 | 0 | 13.2s | 57.5s | 15.654 msg/min ¹ |
-| **50.000** | **50.002** | **50.002** | **0** | **45.3s** | **96.9s** | **30.976 msg/min** |
 
 ¹ Throughput menor por cold start do KEDA (scale-to-zero → primeiro container demora ~45s para subir).
 
-> 📌 Os números acima usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out e job tracking, mas **não exercitam o Bot Framework de verdade** para 50k usuários distintos. Em cenário real, o **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot). Para 100k+, é esperado:
-> - Throughput sustentado de ~3.000 msg/min por bot
+> 📌 Os números usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out, fila, autoscale, job tracking e remoção de refs inválidas — mas **não exercitam o Bot Framework com 50k usuários distintos**. Em cenário real:
+> - **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot, ~3.000 msg/min)
 > - 100k mensagens em ~30–40 minutos com 1 bot
 > - Para janelas mais agressivas, paralelizar com múltiplos bots por audiência
 
