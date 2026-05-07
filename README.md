@@ -1,6 +1,6 @@
 # 📨 Teams Proactive Messaging
 
-Demo de referência para **envio de mensagens proativas 1:1 em massa via Microsoft Teams** — desenhada para escalar para dezenas / centenas de milhares de funcionários, sem cair em rate limits do Power Platform ou Graph API.
+Demo de referência para **envio de mensagens proativas 1:1 em massa via Microsoft Teams** — validada com carga de até **50.000 mensagens** e desenhada para respeitar rate limits do Power Platform, Graph API e Bot Framework.
 
 > ⚠️ Este repositório é **demo / prova de conceito**. Antes de usar em produção, revise: segurança, escalabilidade, observabilidade, custos e conformidade. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [SUPPORT.md](./SUPPORT.md).
 
@@ -10,7 +10,7 @@ Demo de referência para **envio de mensagens proativas 1:1 em massa via Microso
 
 | Capacidade | Como |
 |---|---|
-| 🚀 Fan-out massivo | Streaming generator das refs + parallel batch flush no Service Bus (5 batches em vôo) |
+| 🚀 Fan-out assíncrono | Streaming generator das refs + parallel batch flush no Service Bus (5 batches em vôo) |
 | 🎯 Token bucket global | Lua script atômico no Redis. `RATE_LIMIT_PER_SEC` aplicado **globalmente** entre todas as réplicas do worker |
 | 🎴 Adaptive Cards | `POST /api/send` aceita texto **ou** `{ type:"AdaptiveCard", content:<card> }` |
 | 🔁 Idempotência | `messageId = jobId:md5(rowKey):repeatIndex` (efetivo em SB Standard/Premium) |
@@ -23,7 +23,7 @@ Demo de referência para **envio de mensagens proativas 1:1 em massa via Microso
 
 ## Por que essa arquitetura?
 
-Em cenários reais de comunicação corporativa em massa via Teams (10k–100k+ usuários), as alternativas comumente tentadas têm comportamentos diferentes:
+Em cenários de comunicação corporativa em massa via Teams, as alternativas comumente tentadas têm comportamentos diferentes:
 
 | Abordagem | Realidade |
 |---|---|
@@ -48,6 +48,7 @@ Esta demo **não burla rate limits** — usa o canal certo. O envio depende do T
 - [Como iniciar (dev local)](#como-iniciar-dev-local)
 - [Deploy em Azure](#deploy-em-azure)
 - [Deploy do Teams App](#deploy-do-teams-app)
+- [Apresentação técnica compacta](#apresentação-técnica-compacta)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -303,7 +304,7 @@ x-api-key: <API_KEY>
 | Campo | Tipo | Obrigatório | Descrição |
 |---|---|---|---|
 | `message` | string \| object | sim | Texto OU `{ type:"AdaptiveCard", content:<card json> }` |
-| `repeat` | int | não | Cópias por usuário (default `1`, máx `100000`). Útil para testes de stress |
+| `repeat` | int | não | Cópias por usuário (default `1`). Útil para testes controlados de stress; use com cautela. |
 
 ```json
 HTTP/1.1 202 Accepted
@@ -322,7 +323,7 @@ HTTP/1.1 202 Accepted
 
 > ⚠️ **`repeat` multiplica `refs × repeat`** mensagens reais para o Bot Framework. Use com cuidado em produção — útil principalmente para load testing.
 >
-> Na implementação atual, o `202 Accepted` é retornado **depois** que a API termina o streaming das refs e enfileira as mensagens no Service Bus. Portanto, um envio para 100k+ usuários ainda pode manter a conexão HTTP aberta durante a fase de enqueue. Uma evolução recomendada é mover o fan-out para um producer/background job e responder imediatamente após `createJob`.
+> Na implementação atual, o `202 Accepted` é retornado **depois** que a API termina o streaming das refs e enfileira as mensagens no Service Bus. Em volumes elevados, a conexão HTTP permanece aberta durante a fase de enqueue.
 
 ### `GET /api/jobs/:id`
 
@@ -582,6 +583,19 @@ az containerapp create -g $RG -n worker-teams-msgs \
 3. Suba em **Teams Admin Center → Manage apps → Upload new app**.
 4. **Setup policies → Global → Installed apps → Add apps** (org-wide).
 5. Propagação org-wide leva 24–48h. Para testes imediatos, instale manualmente em **Apps → Built for your org**.
+
+---
+
+## Apresentação técnica compacta
+
+O arquivo [`presentation-compact.html`](./presentation-compact.html) contém uma apresentação HTML curta, em formato de telas, para compartilhamento por email ou exportação para PDF. Ela resume:
+
+- problema e escolha técnica;
+- APIs sugeridas;
+- componentes Azure sugeridos;
+- arquitetura lógica;
+- capacidade esperada com base em carga testada de até **50.000 mensagens**;
+- trechos técnicos principais.
 
 ## Troubleshooting
 

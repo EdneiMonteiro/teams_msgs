@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Teams Proactive Messaging - Technical Brief</title>
+  <style>
+    :root {
+      --bg: #07111f;
+      --card: #101d32;
+      --card2: #162842;
+      --text: #eff6ff;
+      --muted: #aebed4;
+      --blue: #5fb2ff;
+      --green: #75e6b4;
+      --yellow: #ffd166;
+      --red: #ff7f94;
+      --line: rgba(255,255,255,.16);
+      --shadow: 0 16px 50px rgba(0,0,0,.28);
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .deck {
+      width: 100%;
+    }
+
+    .slide {
+      width: 100vw;
+      min-height: 100vh;
+      padding: 42px 56px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 22px;
+      background:
+        radial-gradient(circle at 10% 10%, rgba(95,178,255,.24), transparent 30%),
+        radial-gradient(circle at 90% 18%, rgba(117,230,180,.16), transparent 30%),
+        linear-gradient(135deg, #08111f 0%, #0d1a2e 100%);
+      border-bottom: 1px solid var(--line);
+      page-break-after: always;
+    }
+
+    .kicker {
+      color: var(--green);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    h1, h2, h3 { margin: 0; line-height: 1.05; letter-spacing: -.03em; }
+    h1 { font-size: clamp(48px, 6vw, 84px); max-width: 1100px; }
+    h2 { font-size: clamp(34px, 4.2vw, 56px); max-width: 1180px; }
+    h3 { font-size: 22px; margin-bottom: 10px; }
+
+    p {
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.42;
+      margin: 12px 0 0;
+    }
+
+    .subtitle {
+      color: #dcecff;
+      font-size: 26px;
+      max-width: 1040px;
+      margin-top: 20px;
+    }
+
+    .grid { display: grid; gap: 18px; }
+    .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.045));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .card.good { border-color: rgba(117,230,180,.45); }
+    .card.warn { border-color: rgba(255,209,102,.46); }
+    .card.bad { border-color: rgba(255,127,148,.46); }
+
+    .metric {
+      font-size: clamp(38px, 4.4vw, 64px);
+      font-weight: 850;
+      line-height: .95;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+
+    .metric span {
+      font-size: .42em;
+      color: var(--muted);
+      font-weight: 650;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.35;
+    }
+
+    ul {
+      margin: 10px 0 0;
+      padding-left: 20px;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.38;
+    }
+
+    li + li { margin-top: 6px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: rgba(255,255,255,.045);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      font-size: 16px;
+    }
+
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--green);
+      background: rgba(255,255,255,.075);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    code, pre {
+      font-family: Consolas, "Cascadia Code", "Courier New", monospace;
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 14px;
+      line-height: 1.35;
+      color: #e6f1ff;
+    }
+
+    .code {
+      background: #06101d;
+      border: 1px solid rgba(95,178,255,.24);
+      border-radius: 16px;
+      padding: 16px;
+      overflow: auto;
+      max-height: 340px;
+    }
+
+    .tag {
+      display: inline-flex;
+      border: 1px solid rgba(117,230,180,.35);
+      background: rgba(117,230,180,.09);
+      color: #dffbed;
+      border-radius: 999px;
+      padding: 7px 11px;
+      margin: 6px 6px 0 0;
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .arch {
+      width: 100%;
+      min-height: 420px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: rgba(255,255,255,.035);
+      box-shadow: var(--shadow);
+    }
+
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: rgba(239,246,255,.55);
+      font-size: 13px;
+    }
+
+    .lead-row {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      gap: 22px;
+      align-items: start;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .step {
+      border: 1px solid rgba(95,178,255,.32);
+      background: rgba(95,178,255,.08);
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 112px;
+      position: relative;
+    }
+
+    .step:not(:last-child)::after {
+      content: ">";
+      color: var(--green);
+      position: absolute;
+      right: -12px;
+      top: 42%;
+      font-size: 24px;
+      font-weight: 900;
+    }
+
+    .step strong {
+      display: block;
+      color: var(--text);
+      font-size: 15px;
+      margin-bottom: 6px;
+    }
+
+    .step span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.28;
+    }
+
+    @media (max-width: 900px) {
+      .slide { padding: 28px 20px; }
+      .cols-2, .cols-3, .cols-4, .lead-row, .flow { grid-template-columns: 1fr; }
+      .step:not(:last-child)::after { display: none; }
+    }
+
+    @media print {
+      .slide { width: 100%; min-height: 100vh; }
+      body { background: white; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck">
+    <section class="slide">
+      <header>
+        <div class="kicker">Technical brief</div>
+        <h1>Teams Proactive Messaging em escala</h1>
+        <p class="subtitle">Arquitetura sugerida para broadcast 1:1 via Teams usando Bot Framework, fila, workers elásticos e rate limit global.</p>
+      </header>
+      <div class="grid cols-3">
+        <div class="card good">
+          <div class="metric">50.000</div>
+          <div class="small">Mensagens em carga validada nesta demo.</div>
+        </div>
+        <div class="card good">
+          <div class="metric">50<span> msg/s</span></div>
+          <div class="small">Referência conservadora por bot com token bucket.</div>
+        </div>
+        <div class="card good">
+          <div class="metric">0<span> falhas</span></div>
+          <div class="small">Resultado observado no teste controlado de 50.000 mensagens.</div>
+        </div>
+      </div>
+      <footer class="footer"><span>Objetivo: entendimento técnico rápido</span><span>1 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">Problema e escolha técnica</div>
+        <h2>Broadcast massivo exige canal correto e controle de taxa</h2>
+      </header>
+      <table>
+        <thead>
+          <tr>
+            <th>Abordagem</th>
+            <th>Realidade em alto volume</th>
+            <th>Uso recomendado</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Power Automate</strong></td>
+            <td>Limites por licença/conector; não projetado para processamento massivo; pode sofrer throttling e latência.</td>
+            <td>Fluxos de automação e integrações de menor escala.</td>
+          </tr>
+          <tr>
+            <td><strong>Microsoft Graph</strong></td>
+            <td>Throttling multi-nível: app, tenant e user. Bom para integração, não para broadcast massivo.</td>
+            <td>Operações direcionadas e integrações com Microsoft 365.</td>
+          </tr>
+          <tr>
+            <td><strong>Bot Framework</strong></td>
+            <td>Canal nativo para notificações e proactive messaging; melhor suporte para escala, com rate limits dinâmicos.</td>
+            <td>Mensagens proativas 1:1 após instalação do Teams App.</td>
+          </tr>
+        </tbody>
+      </table>
+      <footer class="footer"><span>Escolha: Bot Framework + pipeline assíncrona</span><span>2 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">APIs sugeridas</div>
+        <h2>Contrato REST simples para disparo, status e operação</h2>
+      </header>
+      <div class="lead-row">
+        <table>
+          <thead>
+            <tr>
+              <th>Método</th>
+              <th>Endpoint</th>
+              <th>Função</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>POST</td><td><code>/api/messages</code></td><td>Messaging endpoint do Azure Bot / Bot Framework.</td></tr>
+            <tr><td>POST</td><td><code>/api/send</code></td><td>Cria job e enfileira mensagens para a audiência registrada.</td></tr>
+            <tr><td>GET</td><td><code>/api/jobs/:id</code></td><td>Consulta progresso: total, sent, failed, status e erros.</td></tr>
+            <tr><td>GET</td><td><code>/api/status</code></td><td>Retorna quantidade de usuários registrados.</td></tr>
+            <tr><td>GET</td><td><code>/healthz</code> / <code>/readyz</code></td><td>Liveness e readiness básica.</td></tr>
+          </tbody>
+        </table>
+        <div class="code"><pre><code>POST /api/send
+Content-Type: application/json
+x-api-key: &lt;API_KEY&gt;
+
+{
+  "message": "Comunicado importante",
+  "repeat": 1
+}
+
+202 Accepted
+{
+  "jobId": "...",
+  "total": 50000,
+  "enqueued": 50000,
+  "statusUrl": "/api/jobs/..."
+}</code></pre></div>
+      </div>
+      <footer class="footer"><span>Payload também aceita Adaptive Card</span><span>3 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">Componentes sugeridos</div>
+        <h2>Runtime mínimo para escala, durabilidade e observabilidade</h2>
+      </header>
+      <table>
+        <thead>
+          <tr>
+            <th>Componente</th>
+            <th>Sugestão</th>
+            <th>Responsabilidade</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Azure Bot + App Registration</td><td>SingleTenant</td><td>Identidade do bot e canal Teams.</td></tr>
+          <tr><td>Container Apps - API</td><td>min 1 / max 3</td><td>Recebe Teams events e chamadas REST.</td></tr>
+          <tr><td>Container Apps - Worker</td><td>KEDA 0..10</td><td>Consome fila e envia mensagens.</td></tr>
+          <tr><td>Service Bus Queue</td><td>Basic ou Standard</td><td>Fan-out, backpressure e DLQ.</td></tr>
+          <tr><td>Table Storage</td><td>Standard LRS</td><td>Fonte durável das conversationReferences.</td></tr>
+          <tr><td>Azure Cache for Redis</td><td>C0+ conforme carga</td><td>Counters, refs index, cache de mensagem e token bucket.</td></tr>
+          <tr><td>Log Analytics</td><td>Retenção operacional</td><td>Logs e investigação de falhas.</td></tr>
+        </tbody>
+      </table>
+      <footer class="footer"><span>Service Bus Standard adiciona duplicate detection nativo</span><span>4 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">Arquitetura lógica</div>
+        <h2>Pipeline de registro, fan-out e entrega controlada</h2>
+      </header>
+      <div class="flow">
+        <div class="step"><strong>Teams App</strong><span>Instalação gera conversationUpdate.</span></div>
+        <div class="step"><strong>API</strong><span>Salva refs e recebe POST /api/send.</span></div>
+        <div class="step"><strong>Table + Redis</strong><span>Refs duráveis + contagem O(1).</span></div>
+        <div class="step"><strong>Service Bus</strong><span>Uma mensagem por destino.</span></div>
+        <div class="step"><strong>Worker</strong><span>Token bucket + retries.</span></div>
+        <div class="step"><strong>Bot Framework</strong><span>continueConversation 1:1.</span></div>
+      </div>
+      <svg class="arch" viewBox="0 0 1160 360" role="img" aria-label="Arquitetura compacta">
+        <defs>
+          <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#75e6b4"></path>
+          </marker>
+        </defs>
+        <rect x="30" y="55" width="190" height="70" rx="14" fill="#142743" stroke="#5fb2ff"></rect>
+        <text x="125" y="88" fill="#eff6ff" font-size="17" font-weight="700" text-anchor="middle">App chamadora</text>
+        <text x="125" y="111" fill="#aebed4" font-size="12" text-anchor="middle">POST /api/send</text>
+
+        <rect x="280" y="30" width="280" height="270" rx="18" fill="#0d192c" stroke="#334763"></rect>
+        <text x="420" y="60" fill="#75e6b4" font-size="16" font-weight="800" text-anchor="middle">Azure Container Apps</text>
+        <rect x="315" y="90" width="210" height="65" rx="12" fill="#17365c" stroke="#5fb2ff"></rect>
+        <text x="420" y="130" fill="#eff6ff" font-size="16" font-weight="700" text-anchor="middle">API</text>
+        <rect x="315" y="205" width="210" height="65" rx="12" fill="#17365c" stroke="#5fb2ff"></rect>
+        <text x="420" y="245" fill="#eff6ff" font-size="16" font-weight="700" text-anchor="middle">Worker KEDA</text>
+
+        <rect x="630" y="35" width="170" height="58" rx="12" fill="#102f2a" stroke="#75e6b4"></rect>
+        <text x="715" y="70" fill="#eff6ff" font-size="15" font-weight="700" text-anchor="middle">Table Storage</text>
+        <rect x="630" y="125" width="170" height="58" rx="12" fill="#102f2a" stroke="#75e6b4"></rect>
+        <text x="715" y="160" fill="#eff6ff" font-size="15" font-weight="700" text-anchor="middle">Redis</text>
+        <rect x="630" y="215" width="170" height="58" rx="12" fill="#102f2a" stroke="#75e6b4"></rect>
+        <text x="715" y="250" fill="#eff6ff" font-size="15" font-weight="700" text-anchor="middle">Service Bus</text>
+
+        <rect x="875" y="95" width="170" height="58" rx="12" fill="#2b2243" stroke="#b99cff"></rect>
+        <text x="960" y="130" fill="#eff6ff" font-size="15" font-weight="700" text-anchor="middle">Azure Bot</text>
+        <rect x="875" y="205" width="170" height="58" rx="12" fill="#2b2243" stroke="#b99cff"></rect>
+        <text x="960" y="240" fill="#eff6ff" font-size="15" font-weight="700" text-anchor="middle">Teams Users</text>
+
+        <line x1="220" y1="90" x2="315" y2="122" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="525" y1="112" x2="630" y2="64" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="525" y1="135" x2="630" y2="154" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="525" y1="154" x2="630" y2="244" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="630" y1="244" x2="525" y2="237" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="525" y1="236" x2="630" y2="154" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="525" y1="236" x2="875" y2="124" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+        <line x1="960" y1="153" x2="960" y2="205" stroke="#75e6b4" stroke-width="3" marker-end="url(#a)"></line>
+      </svg>
+      <footer class="footer"><span>Data plane: Table, Redis, Service Bus</span><span>5 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">Capacidade esperada</div>
+        <h2>Planejamento por taxa de entrega, não por número de workers</h2>
+      </header>
+      <div class="grid cols-3">
+        <div class="card">
+          <div class="metric">50<span> msg/s</span></div>
+          <div class="small">Ponto de partida seguro por bot com `RATE_LIMIT_PER_SEC=50`.</div>
+        </div>
+        <div class="card">
+          <div class="metric">~3k<span>/min</span></div>
+          <div class="small">Capacidade planejada de entrega por bot na configuração conservadora.</div>
+        </div>
+        <div class="card">
+          <div class="metric">~17<span> min</span></div>
+          <div class="small">Estimativa para 50.000 mensagens a 50 msg/s, sem considerar variações operacionais.</div>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Camada</th>
+            <th>Capacidade esperada</th>
+            <th>Controle</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Fan-out API -> Service Bus</td><td>Validado em job de 50.000 mensagens</td><td>`SEND_FLUSH_CONCURRENCY=5` e batch do Service Bus.</td></tr>
+          <tr><td>Worker -> Bot Framework</td><td>Limitada deliberadamente pelo token bucket</td><td>`RATE_LIMIT_PER_SEC`, `RATE_LIMIT_CAPACITY`.</td></tr>
+          <tr><td>Escala horizontal</td><td>0..10 réplicas de worker por KEDA</td><td>Queue depth e `MAX_CONCURRENT=10` por worker.</td></tr>
+        </tbody>
+      </table>
+      <p class="small">A taxa final deve ser validada no ambiente de destino, pois Bot Framework e Teams usam limites dinâmicos.</p>
+      <footer class="footer"><span>Workers aumentam paralelismo; token bucket define o teto global</span><span>6 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">Trechos técnicos principais</div>
+        <h2>Métodos/classes que sustentam escala e controle</h2>
+      </header>
+      <div class="grid cols-2">
+        <div class="code"><pre><code>// API fan-out
+app.post("/api/send", requireApiKey, async (req, res) => {
+  const validation = validateMessage(req.body?.message);
+  const jobId = uuidv4();
+  await createJob(jobId, validation.serialized, total);
+
+  for await (const ref of streamRefs()) {
+    batch.tryAddMessage({
+      body: { jobId, refJson: ref.refJson, rowKey: ref.rowKey },
+      messageId: `${jobId}:${md5(rowKey)}:${repeatIndex}`
+    });
+  }
+});</code></pre></div>
+        <div class="code"><pre><code>// Worker delivery
+if (RATE_LIMIT_ENABLED) {
+  await acquireToken(); // Redis Lua token bucket
+}
+
+await adapter.continueConversation(ref, async (ctx) => {
+  await deliver(ctx, msg); // text or Adaptive Card
+});
+
+await incrementSent(jobId);</code></pre></div>
+      </div>
+      <div>
+        <span class="tag">ProactiveBot</span>
+        <span class="tag">streamRefs()</span>
+        <span class="tag">createJob()</span>
+        <span class="tag">incrementSent()</span>
+        <span class="tag">incrementFailed()</span>
+        <span class="tag">acquireToken()</span>
+        <span class="tag">continueConversation()</span>
+      </div>
+      <footer class="footer"><span>Implementação TypeScript / Node.js</span><span>7 / 8</span></footer>
+    </section>
+
+    <section class="slide">
+      <header>
+        <div class="kicker">Resumo para decisão técnica</div>
+        <h2>Solução proposta: esteira de mensagens proativas, controlada e observável</h2>
+      </header>
+      <div class="grid cols-3">
+        <div class="card good">
+          <h3>Canal adequado</h3>
+          <ul>
+            <li>Bot Framework proactive messaging.</li>
+            <li>Entrega 1:1 após instalação do Teams App.</li>
+            <li>Suporte a texto e Adaptive Cards.</li>
+          </ul>
+        </div>
+        <div class="card good">
+          <h3>Arquitetura elástica</h3>
+          <ul>
+            <li>ACA API + ACA Worker.</li>
+            <li>Service Bus para fan-out e DLQ.</li>
+            <li>KEDA scale-to-zero.</li>
+          </ul>
+        </div>
+        <div class="card good">
+          <h3>Controle operacional</h3>
+          <ul>
+            <li>Redis counters e token bucket.</li>
+            <li>Health/readiness endpoints.</li>
+            <li>Status de job via API.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="subtitle">Resultado: broadcast em massa sem chamadas síncronas por usuário, com capacidade planejável e controle explícito de throttling.</p>
+      <footer class="footer"><span>Technical brief</span><span>8 / 8</span></footer>
+    </section>
+  </main>
+</body>
+</html>
