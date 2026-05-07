@@ -114,20 +114,20 @@ graph LR
 
 ```mermaid
 flowchart LR
-    M1[/api/send<br/>POST] --> M2[validateMessage]
-    M2 -->|texto/card| M3[createJob no Redis<br/>HMSET total/msg/messageType]
-    M3 --> M4[for each ref<br/>streamRefs Table]
-    M4 --> M5[batch.tryAddMessage<br/>messageId=jobId:md5:r]
-    M5 -->|batch cheio| M6[parallel flush<br/>até 5 em vôo]
-    M5 -->|batch ok| M4
-    M6 --> M7[KEDA escala worker<br/>0→10 réplicas]
-    M7 --> M8[acquireToken<br/>Lua bucket]
-    M8 -->|grant| M9[continueConversation]
-    M8 -.->|sem token| M8
-    M9 --> M10{outcome}
-    M10 -->|200| M11[HINCRBY sent]
-    M10 -->|403/410| M12[remove ref<br/>HINCRBY failed]
-    M10 -->|429/5xx| M9
+    M1["/api/send<br/>POST"] --> M2["validateMessage"]
+    M2 -->|"texto/card"| M3["createJob no Redis<br/>HMSET total/msg/messageType"]
+    M3 --> M4["for each ref<br/>streamRefs Table"]
+    M4 --> M5["batch.tryAddMessage<br/>messageId=jobId:md5:r"]
+    M5 -->|"batch cheio"| M6["parallel flush<br/>até 5 em vôo"]
+    M5 -->|"batch ok"| M4
+    M6 --> M7["KEDA escala worker<br/>0→10 réplicas"]
+    M7 --> M8["acquireToken<br/>Lua bucket"]
+    M8 -->|"grant"| M9["continueConversation"]
+    M8 -.->|"sem token"| M8
+    M9 --> M10{"outcome"}
+    M10 -->|"200"| M11["HINCRBY sent"]
+    M10 -->|"403/410"| M12["remove ref<br/>HINCRBY failed"]
+    M10 -->|"429/5xx"| M9
     style M3 fill:#FFE082,color:#000
     style M8 fill:#FFAB91,color:#000
     style M11 fill:#A5D6A7,color:#000
@@ -138,21 +138,19 @@ flowchart LR
 
 ## Componentes Azure
 
-| Recurso | Nome na demo | SKU | Função | Custo aprox. |
-|---|---|---|---|---|
-| App Registration | associado ao Azure Bot | Free | Identidade do bot (SingleTenant) | $0 |
-| Azure Bot | `teams-proactive-msgs-bot` | F0 | Registro Bot Framework + canal Teams | $0 |
-| Container Apps Environment | `aca-teams-msgs` | Consumption | Ambiente compartilhado da API e Worker | incluído no ACA |
-| Container Apps (API) | `api-teams-msgs` | Consumption | Ingress externo, `minReplicas=1` | ~US$ 5/mês |
-| Container Apps (Worker) | `worker-teams-msgs` | Consumption | KEDA scale-to-zero, 0–10 réplicas | pay-per-use |
-| Service Bus | `sb-teams-msgs` / `send-messages` | Basic | Fila + dead-letter | ~US$ 0.05/mês |
-| Table Storage | `stteamsmsgs` / `conversationrefs` | Standard LRS | Refs duráveis | ~US$ 0.01/mês |
-| Azure Cache for Redis | `redis-teams-msgs` | C0 Basic | Counters + refs index + msg cache + token bucket | ~US$ 16/mês |
-| Container Registry | `acrteamsmsgs` | Basic | Imagens API + Worker | ~US$ 5/mês |
-| Log Analytics | `workspace-rgmsgseYKC` | Pay-per-GB (cap 25MB/d) | Logs ACA | ~US$ 2/mês |
+| Recurso | Nome na demo | SKU | Função |
+|---|---|---|---|
+| App Registration | associado ao Azure Bot | Free | Identidade do bot (SingleTenant) |
+| Azure Bot | `teams-proactive-msgs-bot` | F0 | Registro Bot Framework + canal Teams |
+| Container Apps Environment | `aca-teams-msgs` | Consumption | Ambiente compartilhado da API e Worker |
+| Container Apps (API) | `api-teams-msgs` | Consumption | Ingress externo, `minReplicas=1` |
+| Container Apps (Worker) | `worker-teams-msgs` | Consumption | KEDA scale-to-zero, 0–10 réplicas |
+| Service Bus | `sb-teams-msgs` / `send-messages` | Basic | Fila + dead-letter |
+| Table Storage | `stteamsmsgs` / `conversationrefs` | Standard LRS | Refs duráveis |
+| Azure Cache for Redis | `redis-teams-msgs` | C0 Basic | Counters + refs index + msg cache + token bucket |
+| Container Registry | `acrteamsmsgs` | Basic | Imagens API + Worker |
+| Log Analytics | `workspace-rgmsgseYKC` | Pay-per-GB | Logs ACA |
 
-> 💡 Custo total de uma demo: ~**US$ 28/mês**. Workers só geram custo quando há mensagens na fila.
->
 > O diagrama separa **data plane** (Table/Redis/Service Bus) de **support/control plane** (Azure Bot, ACR e Log Analytics). ACR e Log Analytics não participam do envio de cada mensagem, mas são recursos reais necessários para build/deploy e operação da demo.
 
 ---
