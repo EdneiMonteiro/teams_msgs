@@ -1,8 +1,23 @@
 # 📨 Teams Proactive Messaging
 
-Demo de referência para envio de **mensagens proativas 1:1 em massa** via Microsoft Teams para dezenas/centenas de milhares de funcionários, contornando os rate limits do Power Platform e Graph API.
+Demo de referência para **envio de mensagens proativas 1:1 em massa via Microsoft Teams** — desenhada para escalar para dezenas / centenas de milhares de funcionários, sem cair em rate limits do Power Platform ou Graph API.
 
-> ⚠️ **Este repositório é demo / prova de conceito**. Antes de usar em produção, revise: segurança, escalabilidade, observabilidade, custos e conformidade. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [SUPPORT.md](./SUPPORT.md).
+> ⚠️ Este repositório é **demo / prova de conceito**. Antes de usar em produção, revise: segurança, escalabilidade, observabilidade, custos e conformidade. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [SUPPORT.md](./SUPPORT.md).
+
+---
+
+## ✨ Highlights da versão atual (v8)
+
+| Capacidade | Como |
+|---|---|
+| 🚀 Fan-out massivo | Streaming generator das refs + parallel batch flush no Service Bus (5 batches em vôo) |
+| 🎯 Token bucket global | Lua script atômico no Redis. `RATE_LIMIT_PER_SEC` aplicado **globalmente** entre todas as réplicas do worker |
+| 🎴 Adaptive Cards | `POST /api/send` aceita texto **ou** `{ type:"AdaptiveCard", content:<card> }` |
+| 🔁 Idempotência | `messageId = jobId:md5(rowKey):repeatIndex` (efetivo em SB Standard/Premium) |
+| 🩺 Health probes | `/healthz` (liveness) + `/readyz` (Redis + Storage + Service Bus) |
+| 🔒 Hardened auth | `x-api-key` com `timingSafeEqual` |
+| 📊 Job tracking | Counters atômicos em Redis (HINCRBY), TTL 24h, sem race condition |
+| 🧪 Testes | Suíte Jest (22 testes) cobrindo retry / rate limit / validação |
 
 ---
 
@@ -14,7 +29,7 @@ Em cenários reais de comunicação corporativa em massa via Teams (10k–100k+ 
 |---|---|
 | **Power Automate / Power Platform** | Throttling agressivo (~6k chamadas/dia por conexão), custo por execução, latência alta em massa. |
 | **Microsoft Graph (chats / messages)** | Limites por app e por usuário, criação de chat 1:1 é cara, geralmente pensada para uso interativo. |
-| **Bot Framework — proactive messaging** | Canal **projetado** para esse caso. Throughput sustentado de ~50 msg/s por bot, com fan-out por workers. |
+| **Bot Framework — proactive messaging** | Canal **projetado** para esse caso. ~50 msg/s sustentado por bot, com fan-out por workers. |
 
 Esta demo **não burla rate limits** — usa o canal certo. O envio depende do Teams App estar instalado para cada usuário (org-wide via Admin Center), o que faz o bot capturar uma `conversationReference` por usuário e usá-la depois para mandar mensagens 1:1 sem nova interação.
 
@@ -26,41 +41,83 @@ Esta demo **não burla rate limits** — usa o canal certo. O envio depende do T
 - [Componentes Azure](#componentes-azure)
 - [Fluxo de funcionamento](#fluxo-de-funcionamento)
 - [Endpoints da API](#endpoints-da-api)
+- [Token Bucket — rate limit global](#token-bucket--rate-limit-global)
 - [Segurança](#segurança)
 - [Estrutura do projeto](#estrutura-do-projeto)
+- [Testes](#testes)
 - [Como iniciar (dev local)](#como-iniciar-dev-local)
 - [Deploy em Azure](#deploy-em-azure)
 - [Deploy do Teams App](#deploy-do-teams-app)
 - [Benchmarks](#benchmarks)
-- [Roadmap (não implementado)](#roadmap-não-implementado)
+- [Decisões de arquitetura (ADR resumido)](#decisões-de-arquitetura-adr-resumido)
+- [Roadmap](#roadmap)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Arquitetura
 
+### Visão geral
+
 ```mermaid
 graph LR
-    A[Aplicação Cliente] -->|POST /api/send<br/>x-api-key| B[API ACA<br/>ingress externo]
-    B -->|saveRef + SADD| C[(Table Storage<br/>conversationrefs)]
-    B -->|fan-out: jobId+rowKey| D[Service Bus<br/>send-messages]
-    B -->|HMSET job:id| R[(Redis<br/>counters + msg)]
-    D -->|KEDA scaler| E[ACA Worker<br/>0-10 réplicas]
-    E -->|HGET msg + GET ref| R
-    E -->|continueConversation| F[Bot Framework]
-    F -->|1:1 message| G[👤 N usuários]
-    E -->|HINCRBY sent/failed| R
-    E -->|deleteEntity em 403/410| C
-    A -->|GET /api/jobs/:id<br/>x-api-key| B
-    B -->|HGETALL job:id| R
+    Client[Aplicação Cliente]
+    subgraph "ACA Environment"
+        API[API ACA<br/>min=1, ingress externo]
+        W1[Worker ACA<br/>0..10 réplicas KEDA]
+    end
+    Table[(Table Storage<br/>conversationrefs)]
+    Redis[(Redis<br/>jobs + refs index<br/>+ msg cache + token bucket)]
+    SB[(Service Bus<br/>queue: send-messages)]
+    BF[Bot Framework]
+    Users[👥 Usuários do Teams]
+
+    Client -->|POST /api/send<br/>x-api-key| API
+    Client -->|GET /api/jobs/:id| API
+    API -->|streamRefs| Table
+    API -->|HMSET job + SCARD refs| Redis
+    API -->|fan-out batches paralelo| SB
+    SB -->|KEDA scaler| W1
+    W1 -->|HGET msg + acquireToken| Redis
+    W1 -->|continueConversation| BF
+    BF -->|1:1| Users
+    W1 -->|HINCRBY sent/failed| Redis
+    W1 -->|delete em 403/410| Table
+
+    Users -.->|conversationUpdate| API
+    API -.->|saveRef + SADD| Table
 ```
 
 **Princípios:**
 
-- **Redis = caminho quente** — counters atômicos (HINCRBY), index de refs ativos (SCARD), cache do payload da mensagem.
-- **Table Storage = durabilidade** — fonte da verdade das `conversationReferences`.
-- **Service Bus = fan-out** — desacopla API de workers, permite KEDA scale-to-zero, dead-letter para falhas permanentes.
-- **ACA = compute** — API com `minReplicas=1` (sempre ouvindo eventos do Teams) + Worker com `minReplicas=0` (custo zero quando ocioso).
+- **Redis = caminho quente**: counters atômicos (HINCRBY), index de refs ativos (SCARD), cache do payload da mensagem, **token bucket global** (Lua atomic).
+- **Table Storage = durabilidade**: fonte da verdade das `conversationReferences`.
+- **Service Bus = fan-out**: desacopla API de workers, permite KEDA scale-to-zero, dead-letter para falhas permanentes.
+- **ACA = compute**: API com `minReplicas=1` (sempre ouvindo eventos do Teams) + Worker com `minReplicas=0` (custo zero quando ocioso).
+
+### Detalhe — caminho de dados de uma mensagem
+
+```mermaid
+flowchart LR
+    M1[/api/send<br/>POST] --> M2[validateMessage]
+    M2 -->|texto/card| M3[createJob no Redis<br/>HMSET total/msg/messageType]
+    M3 --> M4[for each ref<br/>streamRefs Table]
+    M4 --> M5[batch.tryAddMessage<br/>messageId=jobId:md5:r]
+    M5 -->|batch cheio| M6[parallel flush<br/>até 5 em vôo]
+    M5 -->|batch ok| M4
+    M6 --> M7[KEDA escala worker<br/>0→10 réplicas]
+    M7 --> M8[acquireToken<br/>Lua bucket]
+    M8 -->|grant| M9[continueConversation]
+    M8 -.->|sem token| M8
+    M9 --> M10{outcome}
+    M10 -->|200| M11[HINCRBY sent]
+    M10 -->|403/410| M12[remove ref<br/>HINCRBY failed]
+    M10 -->|429/5xx| M9
+    style M3 fill:#FFE082,color:#000
+    style M8 fill:#FFAB91,color:#000
+    style M11 fill:#A5D6A7,color:#000
+    style M12 fill:#EF9A9A,color:#000
+```
 
 ---
 
@@ -74,7 +131,7 @@ graph LR
 | Container Apps (Worker) | Consumption | KEDA scale-to-zero, 0–10 réplicas | pay-per-use |
 | Service Bus | Basic | Fila + dead-letter | ~US$ 0.05/mês |
 | Table Storage | Standard LRS | Refs duráveis | ~US$ 0.01/mês |
-| Azure Cache for Redis | C0 Basic | Counters + refs index + msg cache | ~US$ 16/mês |
+| Azure Cache for Redis | C0 Basic | Counters + refs index + msg cache + token bucket | ~US$ 16/mês |
 | Container Registry | Basic | Imagens API + Worker | ~US$ 5/mês |
 | Log Analytics | Pay-per-GB (cap 25MB/d) | Logs ACA | ~US$ 2/mês |
 
@@ -104,7 +161,7 @@ sequenceDiagram
     Note over Table,Redis: N refs duráveis<br/>+ index O(1) para contagem
 ```
 
-### Fase 2 — Disparo do comunicado
+### Fase 2 — Disparo do comunicado (com token bucket)
 
 ```mermaid
 sequenceDiagram
@@ -113,56 +170,66 @@ sequenceDiagram
     participant Table as Table Storage
     participant Redis as Redis
     participant SB as Service Bus
-    participant Worker as Worker (0→N via KEDA)
+    participant Worker as Worker (0→N)
     participant Bot as Bot Framework
-    participant User as 👤 usuário
+    participant User as 👤
 
-    Client->>API: POST /api/send (x-api-key)
-    API->>Table: getAllRefs
-    API->>Redis: HMSET job:id (msg + counters)
-    API->>SB: enfileira N msgs (jobId + refJson + rowKey)
+    Client->>API: POST /api/send (x-api-key)<br/>{message | AdaptiveCard, repeat?}
+    API->>API: validateMessage()
+    API->>Redis: HMSET job:id (msg, messageType, total, sent=0, failed=0)
+    API->>Redis: SCARD refs:active (estimativa O(1))
     API-->>Client: 202 {jobId, total, statusUrl}
+    Note over API,Table: Streaming generator<br/>(não materializa array)
+    loop para cada ref (Table)
+        API->>API: tryAddMessage(jobId+rowKey)
+        alt batch cheio
+            API->>SB: sendMessages(batch)<br/>(parallel, até 5 in-flight)
+        end
+    end
+    API->>Redis: updateJobTotal (reconcilia drift Table↔Redis)
 
-    Note over SB,Worker: KEDA detecta queue depth → escala 0→10
+    Note over SB,Worker: KEDA detecta queue depth<br/>→ escala 0→10
 
     par workers em paralelo
         Worker->>SB: receive
-        Worker->>Redis: HGET job:id message (1x por job, cacheado)
-        Worker->>Bot: continueConversation(ref, msg)
+        Worker->>Redis: HGET msg + messageType (cacheado 5min)
+        Worker->>Redis: acquireToken (Lua atomic)
+        Note over Worker,Redis: Bloqueia até obter 1 token<br/>~RATE_LIMIT_PER_SEC global
+        Worker->>Bot: continueConversation(ref, msg/card)
         Bot->>User: mensagem 1:1
         alt sucesso
             Worker->>Redis: HINCRBY sent
-        else 403/410 (bot bloqueado/desinstalado)
+        else 403/410
             Worker->>Table: deleteEntity rowKey
             Worker->>Redis: SREM refs:active + HINCRBY failed
         else 429/5xx
-            Worker->>Worker: backoff/retry
+            Worker->>Worker: Retry-After / backoff
         end
     end
 
     Client->>API: GET /api/jobs/:id
     API->>Redis: HGETALL job:id
-    API-->>Client: {progress, sent, failed, status}
+    API-->>Client: {progress, sent, failed, status, messageType}
 ```
 
 ### Fase 3 — Tratamento de erros
 
 ```mermaid
 flowchart TD
-    A[Worker recebe mensagem] --> B{continueConversation}
+    A[Worker recebe msg da fila] --> AT{acquireToken<br/>Lua bucket}
+    AT -->|grant| B{continueConversation}
+    AT -.->|sem token| AT
     B -->|✅ 200| C[HINCRBY sent]
-    B -->|⚠️ 429| D[Retry após Retry-After]
-    D --> B
-    B -->|⚠️ 5xx| E[Backoff exponencial]
-    E --> B
+    B -->|⚠️ 429| D[Sleep Retry-After] --> B
+    B -->|⚠️ 5xx| E[Backoff exponencial] --> B
     B -->|❌ 403/410| F[Remove ref<br/>HINCRBY failed]
-    B -->|❌ 4xx outro| G[HINCRBY failed<br/>permanente]
-    B -->|❌ erro transitório<br/>retries esgotados| H[throw → SB redeliver<br/>até dead-letter]
+    B -->|❌ 4xx outro| G[HINCRBY failed<br/>permanent]
+    B -->|❌ outro<br/>após retries| H[throw → SB redeliver<br/>até dead-letter]
 
-    style C fill:#4CAF50,color:#fff
-    style F fill:#FF9800,color:#fff
-    style G fill:#FF9800,color:#fff
-    style H fill:#f44336,color:#fff
+    style C fill:#A5D6A7,color:#000
+    style F fill:#FFCC80,color:#000
+    style G fill:#FFCC80,color:#000
+    style H fill:#EF9A9A,color:#000
 ```
 
 ---
@@ -176,7 +243,7 @@ flowchart TD
 | GET | `/api/jobs/:id` | `x-api-key` | Progresso do job (Redis) |
 | GET | `/api/status` | `x-api-key` | Contagem de usuários registrados |
 | GET | `/healthz` | — | Liveness simples |
-| GET | `/readyz` | — | Readiness (Redis + Storage) |
+| GET | `/readyz` | — | Readiness (Redis + Storage + Service Bus) |
 
 ### `POST /api/send`
 
@@ -246,6 +313,7 @@ HTTP/1.1 202 Accepted
 {
   "jobId": "d836...",
   "message": "📢 Comunicado importante para todos os colaboradores!",
+  "messageType": "text",
   "total": 50000,
   "sent": 49988,
   "failed": 12,
@@ -265,11 +333,56 @@ HTTP/1.1 202 Accepted
 
 ---
 
+## Token Bucket — rate limit global
+
+O worker chama `acquireToken()` antes de cada `continueConversation`. Implementação por **Lua script atômico no Redis** — todas as réplicas competem pela mesma chave, então o limite é **global**, não por worker.
+
+```mermaid
+graph TB
+    subgraph "Redis (refilado a cada chamada)"
+        BK[Hash: ratelimit:bot<br/>tokens=N, ts=lastMs]
+    end
+    W1[Worker A] -->|EVAL Lua<br/>capacity=50, rate=50/s| BK
+    W2[Worker B] -->|EVAL Lua| BK
+    W3[Worker C] -->|EVAL Lua| BK
+    W4[Worker N] -->|EVAL Lua| BK
+    BK -->|0 ou 1| W1
+    BK -->|0 ou 1| W2
+    BK -->|0 ou 1| W3
+    BK -->|0 ou 1| W4
+```
+
+**Algoritmo (Lua atomic):**
+
+1. `tokens, ts ← HMGET ratelimit:bot tokens ts`
+2. `elapsed = (now − ts) / 1000`
+3. `tokens = min(capacity, tokens + elapsed × rate)`
+4. Se `tokens ≥ 1` → consome 1 e retorna `1`. Senão retorna `0`.
+5. `HSET tokens ts; EXPIRE 60`
+
+**Configuração:**
+
+| Env var | Default | Descrição |
+|---|---:|---|
+| `RATE_LIMIT_ENABLED` | `true` | Liga/desliga o bucket no worker |
+| `RATE_LIMIT_PER_SEC` | `50` | Taxa de refill (tokens/s) — **teto global de envios** |
+| `RATE_LIMIT_CAPACITY` | `50` | Burst máximo (tokens acumuláveis) |
+| `RATE_LIMIT_KEY` | `ratelimit:bot` | Namespace da chave (útil se compartilhar Redis) |
+
+**Quando ajustar:**
+
+- `RATE_LIMIT_PER_SEC=50`: default seguro pra Bot Framework F0.
+- Se a Microsoft te garantir SLA superior, suba (ex.: `100` ou `200`).
+- Para teste de fumaça **sem** rate limit: `RATE_LIMIT_ENABLED=false`.
+
+---
+
 ## Segurança
 
 - `POST /api/send`, `GET /api/jobs/:id`, `GET /api/status` exigem header `x-api-key` quando `API_KEY` está definida.
-- **Em dev local**, deixar `API_KEY` vazia desliga a checagem (a API loga um warning ao iniciar).
-- **Em produção / cliente**, considere alternativas mais robustas (em ordem de robustez):
+- Comparação com `crypto.timingSafeEqual` (não vulnerável a timing attacks).
+- Em **dev local**, deixar `API_KEY` vazia desliga a checagem (a API loga um warning ao iniciar).
+- Em **produção / cliente**, considere alternativas mais robustas (em ordem de robustez):
   - Entra ID com client credentials + JWT bearer + middleware de validação;
   - APIM como front-door com policies;
   - ACA com ingress interno + APIM/AGW público;
@@ -282,34 +395,67 @@ HTTP/1.1 202 Accepted
 
 ```
 teams_msgs/
-├── src/                       # API (ACA, ingress externo)
-│   ├── index.ts               # Express + endpoints + auth + healthz/readyz
-│   ├── bot.ts                 # ProactiveBot (captura conversationReferences)
-│   ├── table-store.ts         # Refs duráveis em Table Storage + sincroniza Redis SET
-│   └── redis-tracker.ts       # Job counters + refs index + cache da mensagem
-├── worker/                    # Worker (ACA, KEDA scale-to-zero)
+├── src/                          # API (ACA, ingress externo)
+│   ├── index.ts                  # Express + endpoints + auth + healthz/readyz
+│   ├── bot.ts                    # ProactiveBot (captura conversationReferences)
+│   ├── table-store.ts            # Refs duráveis em Table Storage + streamRefs()
+│   ├── redis-tracker.ts          # Job counters + refs index + msg cache + token bucket
+│   ├── send-retry.ts             # Helper puro de retry (testável)
+│   └── validate-message.ts       # Validador puro (text vs AdaptiveCard)
+├── worker/                       # Worker (ACA, KEDA scale-to-zero)
 │   ├── src/
-│   │   ├── index.ts           # bootstrap
-│   │   ├── worker.ts          # Service Bus consumer + Bot Framework sender
-│   │   ├── redis-tracker.ts   # incrementSent/Failed + getJobMessage
-│   │   └── table-store.ts     # removeRefByRowKey (limpeza em 403/410)
+│   │   ├── index.ts              # bootstrap
+│   │   ├── worker.ts             # SB consumer + Bot Framework sender + token bucket
+│   │   ├── redis-tracker.ts      # incrementSent/Failed + getJobMessage + acquireToken
+│   │   └── table-store.ts        # removeRefByRowKey (limpeza em 403/410)
 │   └── Dockerfile
-├── manifest/                  # Pacote Teams App
-│   ├── manifest.json
-│   ├── color.png              # 192x192
-│   └── outline.png            # 32x32
+├── __tests__/                    # Suite Jest (npm test)
+│   ├── rate-limit.test.ts        # Token bucket math (6 tests)
+│   ├── send-retry.test.ts        # Retry / 429 / 403 / 5xx (9 tests)
+│   └── validate-message.test.ts  # Validação text/AdaptiveCard (7 tests)
+├── manifest/                     # Pacote Teams App
+│   ├── manifest.json             # Substitua <MICROSOFT_APP_ID> e <your-api-fqdn>
+│   ├── color.png                 # 192×192
+│   └── outline.png               # 32×32
 ├── load_test/
-│   ├── run-50k.js             # Single-job, N usuários simulados
-│   └── run-waves.js           # Waves sequenciais (cold start vs warm)
-├── Dockerfile                 # API
-├── .env.example
-├── package.json
+│   ├── run-50k.js                # Single-job, N usuários simulados
+│   └── run-waves.js              # Waves sequenciais (cold start vs warm)
+├── Dockerfile                    # API (com HEALTHCHECK)
+├── jest.config.js
 ├── tsconfig.json
+├── package.json                  # engines.node>=20, scripts.test=jest
+├── .env.example
 ├── DISCLAIMER.md
 ├── SUPPORT.md
 ├── LICENSE
 └── README.md
 ```
+
+---
+
+## Testes
+
+```bash
+npm install
+npm test
+```
+
+```
+PASS __tests__/validate-message.test.ts
+PASS __tests__/send-retry.test.ts
+PASS __tests__/rate-limit.test.ts
+
+Test Suites: 3 passed, 3 total
+Tests:       22 passed, 22 total
+```
+
+| Suíte | Cobertura |
+|---|---|
+| `rate-limit.test.ts` | Token bucket math (refill, cap, sustained rate ~50/s), Lua script sanity |
+| `send-retry.test.ts` | 200/429/403/410/5xx/4xx/transient, Retry-After header parsing |
+| `validate-message.test.ts` | Texto vazio, número, null, AdaptiveCard malformado, AdaptiveCard válido |
+
+Os helpers `sendWithRetry` e `validateMessage` foram **extraídos** para módulos puros (sem dependência do `BotFrameworkAdapter`), permitindo unit tests sem mocks pesados.
 
 ---
 
@@ -321,9 +467,14 @@ cd teams_msgs
 npm install
 cd worker && npm install && cd ..
 cp .env.example .env       # edite com seus valores
-npm run dev                # API em http://localhost:3978
 
-# Em outro terminal — expõe o endpoint para o Bot Framework:
+# Rodar testes
+npm test
+
+# Rodar API local
+npm run dev                # http://localhost:3978
+
+# Em outro terminal — expor para o Bot Framework:
 ngrok http 3978
 # → atualize o Messaging Endpoint do Azure Bot para https://<ngrok>/api/messages
 ```
@@ -369,6 +520,7 @@ az containerapp create -g $RG -n api-teams-msgs \
             app-pwd=<bot> api-key=<random> \
   --env-vars MICROSOFT_APP_ID=<id> MICROSOFT_APP_TENANT_ID=<tenant> \
              PORT=3978 \
+             SEND_FLUSH_CONCURRENCY=5 \
              SERVICE_BUS_CONNECTION=secretref:sb-conn \
              STORAGE_CONNECTION=secretref:storage-conn \
              REDIS_CONNECTION=secretref:redis-conn \
@@ -379,7 +531,7 @@ az containerapp create -g $RG -n api-teams-msgs \
 az bot update -g $RG -n teams-proactive-msgs-bot \
   --endpoint "https://<api-fqdn>/api/messages"
 
-# Deploy Worker (KEDA scale-to-zero)
+# Deploy Worker (KEDA scale-to-zero + token bucket)
 az containerapp create -g $RG -n worker-teams-msgs \
   --environment aca-teams-msgs \
   --image $ACR.azurecr.io/teams-msgs-worker:v1 \
@@ -387,6 +539,9 @@ az containerapp create -g $RG -n worker-teams-msgs \
   --secrets sb-conn=<sb> storage-conn=<st> redis-conn=<redis> app-pwd=<bot> \
   --env-vars MICROSOFT_APP_ID=<id> MICROSOFT_APP_TENANT_ID=<tenant> \
              MAX_CONCURRENT=10 \
+             RATE_LIMIT_ENABLED=true \
+             RATE_LIMIT_PER_SEC=50 \
+             RATE_LIMIT_CAPACITY=50 \
              SERVICE_BUS_CONNECTION=secretref:sb-conn \
              STORAGE_CONNECTION=secretref:storage-conn \
              REDIS_CONNECTION=secretref:redis-conn \
@@ -424,9 +579,9 @@ Medidos em ambiente real: 1–10 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Tab
 | Tempo de processamento | **734.3s** (~12 min 14 s) |
 | Tempo total | **775.9s** (~13 min) |
 | **Throughput sustentado** | **4.086 msg/min** (~68 msg/s) |
-| Rate limit configurado | `RATE_LIMIT_PER_SEC=50` (= teto teórico 3.000 msg/min) |
+| Rate limit configurado | `RATE_LIMIT_PER_SEC=50` (teto teórico ~3.000 msg/min) |
 
-> ⚠️ A v8 introduz **token bucket global no Redis**. O throughput agora é **deliberadamente limitado** ao patamar configurado em `RATE_LIMIT_PER_SEC`, que é o limite efetivo do Bot Framework. Em demos sem rate limit (v6/v7), o throughput chegava a 30–40k msg/min — mas em produção o Bot Framework rejeita essa carga com 429.
+> ⚠️ A v8 introduz **token bucket global no Redis**. O throughput agora é **deliberadamente limitado** ao patamar configurado em `RATE_LIMIT_PER_SEC`, que é o limite efetivo do Bot Framework. Em demos sem rate limit (v6/v7), o throughput chegava a 30–40k msg/min — mas em produção o Bot Framework rejeitaria essa carga com 429 em cascata.
 
 ### Histórico de evolução (mesmo cenário — 50K refs)
 
@@ -434,9 +589,19 @@ Medidos em ambiente real: 1–10 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Tab
 |---|---|---:|---:|---|
 | v1 (POC) | Cosmos DB + ETag retries | — | travado em 71% | Race condition em writes concorrentes |
 | v3 | Redis (counters) + Table Storage (refs/jobs) | 30.976 msg/min | 0 | Job tracking no Redis resolve race condition |
-| v6 | Redis (counters + refs index + msg cache) + Table Storage (refs only) | 42.821 msg/min | 0 | Mensagem cacheada no Redis, payload SB menor, hash do messageId |
+| v6 | Redis (counters + refs index + msg cache) + Table Storage (refs only) | 42.821 msg/min | 0 | Mensagem cacheada no Redis, payload SB menor |
 | v7 | Param `repeat` no `/api/send` | 37.089 msg/min | 0 | Variância natural ~13% (Bot Framework + SB Basic compartilhados) |
-| **v8 (atual)** | **Streaming + Adaptive Cards + Token Bucket Redis + testes Jest** | **4.086 msg/min** | **0** | Throughput limitado por design (RATE_LIMIT_PER_SEC=50) — protege Bot Framework de 429 |
+| **v8 (atual)** | **Streaming + Adaptive Cards + Token Bucket Redis + Jest** | **4.086 msg/min** | **0** | Limitado por design; protege Bot Framework de 429 |
+
+**Visualização do throughput sustentado por versão:**
+
+```
+v1   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  TRAVADO @ 71%
+v3   ████████████████████░░░░░░░░░░░░░░░░░░░░  30.976 msg/min
+v6   ████████████████████████████░░░░░░░░░░░░  42.821 msg/min  ← teto sem rate limit
+v7   █████████████████████████░░░░░░░░░░░░░░░  37.089 msg/min
+v8   ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   4.086 msg/min  ← limitado por RATE_LIMIT_PER_SEC=50
+```
 
 ### Sem rate limit (workload "nu", v6/v7)
 
@@ -449,31 +614,51 @@ Medidos em ambiente real: 1–10 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Tab
 
 ¹ Throughput menor por cold start do KEDA (scale-to-zero → primeiro container demora ~45s para subir).
 
-> 📌 Os números usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out, fila, autoscale, job tracking e remoção de refs inválidas. Em produção, o **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot, ~3.000 msg/min):
+> 📌 Os números usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out, fila, autoscale, job tracking e remoção de refs inválidas. Em produção:
+> - **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot, ~3.000 msg/min)
 > - 100k mensagens em ~30–40 minutos com 1 bot
 > - Para janelas mais agressivas, paralelizar com múltiplos bots por audiência
 > - **Recomendação**: manter `RATE_LIMIT_PER_SEC=50` (default) e ajustar conforme sua negociação com Microsoft
 
 ---
 
-## Roadmap (não implementado nesta demo)
+## Decisões de arquitetura (ADR resumido)
 
-Items que fariam sentido em uma evolução para produção:
+| Decisão | Por quê |
+|---|---|
+| **SingleTenant bot** | MultiTenant foi descontinuado no Azure Bot (mai/2026). UserAssignedMSI é mais complexo sem benefício para o caso de uso. |
+| **ACA em vez de Functions** | Functions com B1 plan dá timeout de startup com node_modules grande. ACA + KEDA tem melhor ergonomia para workloads queue-driven longos. |
+| **Redis para counters** | Cosmos DB com ETag travava em ~71% num cenário de 50K writes concorrentes ao mesmo doc. `HINCRBY` no Redis é atomic e O(1). |
+| **Table Storage para refs** | Cheap (~$0.01/mês), durável, write-rare-read-bulk, sem hot partition para 100k+. |
+| **Service Bus Basic** | Suficiente para queue + dead-letter. Standard só vale se precisar duplicate detection nativo. |
+| **Token bucket no Redis (Lua)** | Único ponto de coordenação atomic entre N réplicas; fica naturalmente onde counters e msg cache já estão. |
+| **Streaming refs** | Para 100k+ refs, materializar array em memória dá OOM. Generator yield + parallel flush = O(1) memory. |
+| **Adaptive Cards via union type** | Mantém retrocompatibilidade. Cards grandes ainda cabem no SB (256KB Basic). |
+
+---
+
+## Roadmap
+
+Implementado em **v8** (esta versão):
+- ✅ Token bucket global no Redis (RATE_LIMIT_PER_SEC / RATE_LIMIT_CAPACITY)
+- ✅ Adaptive Cards no `/api/send`
+- ✅ Streaming refs + parallel batch flushing
+- ✅ Suite de testes Jest (`npm test`)
+- ✅ `timingSafeEqual` no comparador de API_KEY
+- ✅ Drop tracking (mensagens > 256KB → `incrementFailed`)
+
+Não implementado (próximas evoluções):
 
 - **Backpressure adaptativo** — reduzir concorrência por worker quando 429s aparecerem; aumentar quando 200s sustentados.
 - **Segmentação de audiência** — `POST /api/send` com filtro (lista CSV, departamento, país, tags).
-- **Idempotência forte** — Service Bus Standard/Premium com duplicate detection (já populamos `messageId`).
-- **Reconciliação Redis ↔ Table** — job periódico para sincronizar `refs:active` SET com a tabela.
-- **Particionamento das refs** — distribuir entre múltiplas partitions por hash, evitando hot partition em Table Storage.
+- **Idempotência forte** — Service Bus Standard/Premium com duplicate detection (`messageId` já populado).
+- **Reconciliação periódica Redis ↔ Table** — job timer para sincronizar `refs:active` SET com a tabela.
+- **Particionamento das refs** — distribuir entre múltiplas partitions por hash, evitando hot partition.
 - **Auditoria + governança** — modelo de "campanha" com owner, aprovação, dry-run, histórico.
 - **OIDC / Entra ID** — substituir `x-api-key` por validação de JWT.
 - **Logs estruturados + métricas** — pino/winston JSON, OpenTelemetry, métricas Prometheus customizadas.
-
-✅ **Implementado em v8 (2026-05):**
-- Token bucket global no Redis (RATE_LIMIT_PER_SEC / RATE_LIMIT_CAPACITY)
-- Adaptive Cards no `/api/send` (text OU `{type:"AdaptiveCard", content:...}`)
-- Streaming refs + parallel batch flushing (até 5 batches em vôo)
-- Suite de testes Jest (`npm test`) cobrindo retry/rate limit/validação
+- **Cancelamento de job** (`POST /api/jobs/:id/cancel`) — útil para abortar broadcast em curso.
+- **Webhook de conclusão** — POST callback ao cliente quando job termina.
 
 ---
 
@@ -485,9 +670,14 @@ Items que fariam sentido em uma evolução para produção:
 | `Failed to decrypt conversation id` | Tipo do bot foi alterado depois das refs serem salvas | Limpe a tabela `conversationrefs` e reinstale o Teams app |
 | `401 Unauthorized` em `/api/send` | `x-api-key` faltando ou divergente | Veja env var `API_KEY` na ACA |
 | Workers não escalam | Regra KEDA mal configurada | `az containerapp show` e verifique `scale.rules` |
-| `403 Forbidden` em alguns usuários | Usuário bloqueou ou desinstalou o bot | Normal — agora o worker remove a ref automaticamente |
-| `429 Too Many Requests` em volume | Throttling do Bot Framework | Workers fazem retry com `Retry-After`; reduza `MAX_CONCURRENT` se persistir |
+| Throughput muito baixo (~3-4k msg/min) | `RATE_LIMIT_PER_SEC` ativo (comportamento esperado em v8) | Para testes "nus", use `RATE_LIMIT_ENABLED=false` |
+| `403 Forbidden` em alguns usuários | Usuário bloqueou ou desinstalou o bot | Normal — worker remove a ref automaticamente |
+| `429 Too Many Requests` em volume | Throttling do Bot Framework apesar do rate limit | Reduza `RATE_LIMIT_PER_SEC` (ex.: 30) |
+| `400 AdaptiveCard precisa de 'content'` | `message.content` ausente ou não-objeto | Veja [Endpoints da API](#endpoints-da-api) — content tem que ter `type:"AdaptiveCard"` |
+| `Length of 'messageId' property cannot be greater than 128` | Custom messageId muito longo | Já corrigido em v6 (md5 do rowKey); rebaixe imagem se persistir |
 | `/readyz` retorna 503 | Redis ou Storage não acessíveis | Cheque connection strings e regras de firewall |
+| Job travado em < 100% indefinidamente | Mensagens na DLQ ou drift de refs | `az servicebus queue show … countDetails` e cheque `deadLetterMessageCount` |
+| `npm test` falha com erro de tipo | Versão do TS/Node incorreta | `engines.node>=20` no package.json — use Node 20+ |
 
 ---
 
