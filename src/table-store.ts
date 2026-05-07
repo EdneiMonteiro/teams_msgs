@@ -1,142 +1,105 @@
 // Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
 // See LICENSE and DISCLAIMER.md in the project root for details.
-import { TableClient, TableEntity } from "@azure/data-tables";
+//
+// Persistência durável dos conversationReferences em Azure Table Storage.
+// O index ativo (para contagem rápida e fan-out) é mantido em paralelo no
+// Redis (refsAdd / refsRemove / refsCount). Table Storage é a fonte da
+// verdade; Redis é cache otimizado para leitura.
 
-function getStorageConnection(): string {
-  return process.env.STORAGE_CONNECTION || "";
-}
+import { TableClient, TableEntity } from "@azure/data-tables";
+import { refsAdd, refsRemove } from "./redis-tracker";
+
+const TABLE_NAME = "conversationrefs";
+const PARTITION = "refs";
 
 export interface ConversationRef extends TableEntity {
-  partitionKey: string; // "refs"
-  rowKey: string; // conversationId (base64-safe)
-  refJson: string; // serialized ConversationReference
+  partitionKey: string;
+  rowKey: string;
+  refJson: string;
 }
 
-export interface JobEntity extends TableEntity {
-  partitionKey: string; // "jobs"
-  rowKey: string; // jobId
-  message: string;
-  total: number;
-  sent: number;
-  failed: number;
-  status: string; // queued | processing | completed | failed
-  createdAt: string;
-  updatedAt: string;
-  errors: string; // JSON array of first N errors
+let cachedClient: TableClient | null = null;
+let tableEnsured = false;
+
+function getClient(): TableClient {
+  if (!cachedClient) {
+    const conn = process.env.STORAGE_CONNECTION || "";
+    cachedClient = TableClient.fromConnectionString(conn, TABLE_NAME);
+  }
+  return cachedClient;
 }
 
-function getRefsTable(): TableClient {
-  return TableClient.fromConnectionString(getStorageConnection(), "conversationrefs");
-}
-
-function getJobsTable(): TableClient {
-  return TableClient.fromConnectionString(getStorageConnection(), "jobs");
-}
-
-// Ensure tables exist
-let tablesCreated = false;
 export async function ensureTables(): Promise<void> {
-  if (tablesCreated) return;
-  await getRefsTable().createTable().catch(() => {});
-  await getJobsTable().createTable().catch(() => {});
-  tablesCreated = true;
+  if (tableEnsured) return;
+  await getClient().createTable().catch(() => {});
+  tableEnsured = true;
 }
 
-// --- Conversation References ---
-
-function safeRowKey(id: string): string {
-  return Buffer.from(id).toString("base64url");
+export function safeRowKey(conversationId: string): string {
+  return Buffer.from(conversationId).toString("base64url");
 }
 
 export async function saveRef(conversationId: string, refJson: string): Promise<void> {
   await ensureTables();
+  const rowKey = safeRowKey(conversationId);
   const entity: ConversationRef = {
-    partitionKey: "refs",
-    rowKey: safeRowKey(conversationId),
+    partitionKey: PARTITION,
+    rowKey,
     refJson,
   };
-  await getRefsTable().upsertEntity(entity, "Replace");
+  await getClient().upsertEntity(entity, "Replace");
+  await refsAdd(rowKey).catch((err) => {
+    console.warn(`[TABLE] refsAdd falhou (não-fatal): ${err.message || err}`);
+  });
 }
 
 export async function removeRef(conversationId: string): Promise<void> {
   await ensureTables();
+  const rowKey = safeRowKey(conversationId);
   try {
-    await getRefsTable().deleteEntity("refs", safeRowKey(conversationId));
-  } catch {}
+    await getClient().deleteEntity(PARTITION, rowKey);
+  } catch {
+    // entidade já removida
+  }
+  await refsRemove(rowKey).catch((err) => {
+    console.warn(`[TABLE] refsRemove falhou (não-fatal): ${err.message || err}`);
+  });
 }
 
-export async function getAllRefs(): Promise<string[]> {
+export async function removeRefByRowKey(rowKey: string): Promise<void> {
   await ensureTables();
-  const refs: string[] = [];
-  const iter = getRefsTable().listEntities<ConversationRef>({
-    queryOptions: { filter: "PartitionKey eq 'refs'" },
+  try {
+    await getClient().deleteEntity(PARTITION, rowKey);
+  } catch {
+    // já removida
+  }
+  await refsRemove(rowKey).catch(() => {});
+}
+
+export async function getAllRefs(): Promise<{ rowKey: string; refJson: string }[]> {
+  await ensureTables();
+  const refs: { rowKey: string; refJson: string }[] = [];
+  const iter = getClient().listEntities<ConversationRef>({
+    queryOptions: { filter: `PartitionKey eq '${PARTITION}'` },
   });
   for await (const entity of iter) {
-    refs.push(entity.refJson);
+    refs.push({ rowKey: entity.rowKey, refJson: entity.refJson });
   }
   return refs;
 }
 
-export async function countRefs(): Promise<number> {
+export async function countRefsFromTable(): Promise<number> {
+  // Usado apenas como fallback (ex.: reconciliação). O caminho rápido é
+  // refsCount() do redis-tracker, baseado em SCARD.
   const refs = await getAllRefs();
   return refs.length;
 }
 
-// --- Jobs ---
-
-export async function createJob(jobId: string, message: string, total: number): Promise<void> {
-  await ensureTables();
-  const entity: JobEntity = {
-    partitionKey: "jobs",
-    rowKey: jobId,
-    message,
-    total,
-    sent: 0,
-    failed: 0,
-    status: "queued",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    errors: "[]",
-  };
-  await getJobsTable().upsertEntity(entity, "Replace");
-}
-
-export async function getJob(jobId: string): Promise<JobEntity | null> {
-  await ensureTables();
+export async function pingStorage(): Promise<boolean> {
   try {
-    return await getJobsTable().getEntity<JobEntity>("jobs", jobId);
+    await ensureTables();
+    return true;
   } catch {
-    return null;
+    return false;
   }
-}
-
-export async function incrementJobProgress(
-  jobId: string,
-  success: boolean,
-  errorMsg?: string
-): Promise<void> {
-  await ensureTables();
-  const job = await getJob(jobId);
-  if (!job) return;
-
-  if (success) {
-    job.sent = (job.sent || 0) + 1;
-  } else {
-    job.failed = (job.failed || 0) + 1;
-    const errors: string[] = JSON.parse(job.errors || "[]");
-    if (errors.length < 50) {
-      errors.push(errorMsg || "unknown");
-      job.errors = JSON.stringify(errors);
-    }
-  }
-
-  const totalProcessed = (job.sent || 0) + (job.failed || 0);
-  if (totalProcessed >= job.total) {
-    job.status = "completed";
-  } else if (job.status === "queued") {
-    job.status = "processing";
-  }
-
-  job.updatedAt = new Date().toISOString();
-  await getJobsTable().upsertEntity(job, "Replace");
 }

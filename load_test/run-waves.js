@@ -1,19 +1,35 @@
-/**
- * Wave Load Test — roda testes sequenciais com volumes crescentes
- * e coleta resultados para comparação.
- * 
- * Uso: STORAGE_CONNECTION=xxx BOT_URL=xxx node load_test/run-waves.js
- */
+// Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
+//
+// Wave Load Test — roda testes sequenciais com volumes crescentes para
+// observar comportamento do KEDA (cold start, warm pool, throughput).
+//
+// Variáveis: BOT_URL, API_KEY, STORAGE_CONNECTION
+// Uso:       node load_test/run-waves.js [--waves "500,1000,10000,15000"]
 
 const BASE_URL = process.env.BOT_URL || "http://localhost:3978";
+const API_KEY = process.env.API_KEY || "";
 const STORAGE_CONNECTION = process.env.STORAGE_CONNECTION || "";
-const WAVES = [500, 1000, 10000, 15000];
+
+const wavesArg = (() => {
+  const idx = process.argv.indexOf("--waves");
+  return idx >= 0 ? process.argv[idx + 1] : null;
+})();
+const WAVES = wavesArg
+  ? wavesArg.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean)
+  : [500, 1000, 10000, 15000];
+
 const POLL_INTERVAL_MS = 3000;
-const TIMEOUT_MS = 1800000; // 30 min per wave
+const TIMEOUT_MS = 30 * 60 * 1000; // 30 min por wave
+const COOLDOWN_MS = 30000;
 
 const { TableClient } = require("@azure/data-tables");
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function authHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (API_KEY) h["x-api-key"] = API_KEY;
+  return h;
+}
 
 async function seedRefs(count) {
   const table = TableClient.fromConnectionString(STORAGE_CONNECTION, "conversationrefs");
@@ -24,7 +40,10 @@ async function seedRefs(count) {
   for await (const e of iter) {
     if (!e.rowKey.startsWith("fake-")) realRefs.push(e);
   }
-  if (realRefs.length === 0) { console.error("❌ No real refs"); process.exit(1); }
+  if (realRefs.length === 0) {
+    console.error("❌ Nenhuma ref real encontrada. Instale o Teams app primeiro.");
+    process.exit(1);
+  }
 
   let created = 0;
   const start = Date.now();
@@ -35,7 +54,12 @@ async function seedRefs(count) {
       const fakeId = `fake-${j}-${Date.now()}`;
       const fakeRef = JSON.parse(base.refJson);
       fakeRef.conversation = { ...fakeRef.conversation, id: fakeId };
-      promises.push(table.upsertEntity({ partitionKey: "refs", rowKey: fakeId, refJson: JSON.stringify(fakeRef) }, "Replace"));
+      promises.push(
+        table.upsertEntity(
+          { partitionKey: "refs", rowKey: fakeId, refJson: JSON.stringify(fakeRef) },
+          "Replace"
+        )
+      );
     }
     await Promise.all(promises);
     created += promises.length;
@@ -52,15 +76,22 @@ async function cleanupFakeRefs() {
   const table = TableClient.fromConnectionString(STORAGE_CONNECTION, "conversationrefs");
   const fakes = [];
   const iter = table.listEntities({ queryOptions: { filter: "PartitionKey eq 'refs'" } });
-  for await (const e of iter) { if (e.rowKey.startsWith("fake-")) fakes.push(e.rowKey); }
-  let d = 0;
-  for (let i = 0; i < fakes.length; i += 50) {
-    await Promise.all(fakes.slice(i, i + 50).map((k) => table.deleteEntity("refs", k).catch(() => {})));
-    d += Math.min(50, fakes.length - i);
-    if (d % 2000 === 0 || d === fakes.length) process.stdout.write(`\r  Cleanup: ${d}/${fakes.length}`);
+  for await (const e of iter) {
+    if (e.rowKey.startsWith("fake-")) fakes.push(e.rowKey);
   }
-  if (fakes.length > 0) console.log("");
-  return fakes.length;
+  let deleted = 0;
+  const total = fakes.length;
+  for (let i = 0; i < total; i += 50) {
+    await Promise.all(
+      fakes.slice(i, i + 50).map((k) => table.deleteEntity("refs", k).catch(() => {}))
+    );
+    deleted += Math.min(50, total - i);
+    if (deleted % 2000 === 0 || deleted === total) {
+      process.stdout.write(`\r  Cleanup: ${deleted}/${total}`);
+    }
+  }
+  if (total > 0) console.log("");
+  return total;
 }
 
 async function runWave(targetRefs) {
@@ -68,41 +99,49 @@ async function runWave(targetRefs) {
   console.log(`  WAVE: ${targetRefs} refs`);
   console.log(`${"=".repeat(50)}`);
 
-  // Seed
   console.log(`\n🌱 Seeding ${targetRefs} fake refs...`);
-  const seedStart = Date.now();
   await seedRefs(targetRefs);
-  const seedTime = Date.now() - seedStart;
 
-  // Check count
-  const statusResp = await fetch(`${BASE_URL}/api/status`);
+  const statusResp = await fetch(`${BASE_URL}/api/status`, { headers: authHeaders() });
   const status = await statusResp.json();
-  const totalRefs = status.registeredUsers;
-  console.log(`📋 Total refs: ${totalRefs}`);
+  console.log(`📋 Total refs: ${status.registeredUsers}`);
 
-  // Send
   console.log(`🚀 Sending...`);
   const sendStart = Date.now();
   const sendResp = await fetch(`${BASE_URL}/api/send`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders(),
     body: JSON.stringify({ message: `Wave ${targetRefs} — ${new Date().toISOString()}` }),
   });
+
+  if (!sendResp.ok) {
+    const txt = await sendResp.text();
+    console.error(`❌ /api/send falhou: ${sendResp.status} ${txt}`);
+    await cleanupFakeRefs();
+    return null;
+  }
+
   const sendResult = await sendResp.json();
   const enqueueTime = Date.now() - sendStart;
   console.log(`📬 Enqueued ${sendResult.total} msgs in ${(enqueueTime / 1000).toFixed(1)}s`);
 
-  // Poll
   const pollStart = Date.now();
   let result = null;
   while (Date.now() - pollStart < TIMEOUT_MS) {
     await sleep(POLL_INTERVAL_MS);
     try {
-      const job = await (await fetch(`${BASE_URL}/api/jobs/${sendResult.jobId}`)).json();
+      const job = await (await fetch(
+        `${BASE_URL}/api/jobs/${sendResult.jobId}`,
+        { headers: authHeaders() }
+      )).json();
       const processed = (job.sent || 0) + (job.failed || 0);
       const elapsed = ((Date.now() - pollStart) / 1000).toFixed(0);
-      const rate = processed > 0 ? ((processed / (Date.now() - pollStart)) * 60000).toFixed(0) : "0";
-      process.stdout.write(`\r  ${job.progress}% | ${processed}/${job.total} | Rate: ${rate} msg/min | ${elapsed}s   `);
+      const rate = processed > 0
+        ? ((processed / (Date.now() - pollStart)) * 60000).toFixed(0)
+        : "0";
+      process.stdout.write(
+        `\r  ${job.progress}% | ${processed}/${job.total} | Rate: ${rate} msg/min | ${elapsed}s   `
+      );
 
       if (job.status === "completed") {
         const processingTime = Date.now() - pollStart;
@@ -121,14 +160,10 @@ async function runWave(targetRefs) {
     } catch {}
   }
 
-  // Cleanup
   console.log(`🧹 Cleaning up...`);
   await cleanupFakeRefs();
-
-  // Wait for KEDA cooldown to avoid interference between waves
-  console.log(`⏳ Cooldown 30s...`);
-  await sleep(30000);
-
+  console.log(`⏳ Cooldown ${COOLDOWN_MS / 1000}s...`);
+  await sleep(COOLDOWN_MS);
   return result;
 }
 
@@ -138,16 +173,15 @@ async function main() {
   console.log("╠══════════════════════════════════════════════════╣");
   console.log(`║  URL:    ${BASE_URL.substring(0, 40).padEnd(40)}║`);
   console.log(`║  Waves:  ${WAVES.join(", ").padEnd(40)}║`);
+  console.log(`║  Auth:   ${(API_KEY ? "x-api-key present" : "DISABLED (dev)").padEnd(40)}║`);
   console.log("╚══════════════════════════════════════════════════╝");
 
   const results = [];
-
   for (const wave of WAVES) {
-    const result = await runWave(wave);
-    if (result) results.push(result);
+    const r = await runWave(wave);
+    if (r) results.push(r);
   }
 
-  // Summary table
   console.log("\n\n" + "═".repeat(80));
   console.log("  RESULTADO CONSOLIDADO");
   console.log("═".repeat(80));
@@ -160,10 +194,15 @@ async function main() {
   }
   console.log("═".repeat(80));
 
-  // Save
   const fs = require("fs");
-  fs.writeFileSync(__dirname + "/report-waves.json", JSON.stringify({ timestamp: new Date().toISOString(), results }, null, 2));
+  fs.writeFileSync(
+    __dirname + "/report-waves.json",
+    JSON.stringify({ timestamp: new Date().toISOString(), results }, null, 2)
+  );
   console.log("\n📄 Relatório salvo em load_test/report-waves.json\n");
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

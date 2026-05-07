@@ -1,648 +1,426 @@
 # 📨 Teams Proactive Messaging
 
-## Visão Geral
+Demo de referência para envio de **mensagens proativas 1:1 em massa** via Microsoft Teams para dezenas/centenas de milhares de funcionários, contornando os rate limits do Power Platform e Graph API.
 
-Este repositório contém código de exemplo / prova de conceito (PoC) com o objetivo de demonstrar como implementar envio de mensagens proativas 1:1 em massa via Microsoft Teams, utilizando Bot Framework, Azure Service Bus e Azure Table Storage.
+> ⚠️ **Este repositório é demo / prova de conceito**. Antes de usar em produção, revise: segurança, escalabilidade, observabilidade, custos e conformidade. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [SUPPORT.md](./SUPPORT.md).
 
-Este projeto foi criado para fins de aprendizado, avaliação e experimentação.
+---
 
-## ⚠️ Aviso Importante
+## Por que essa arquitetura?
 
-Este repositório contém **código de exemplo e não é destinado para uso em produção**.
+Em cenários reais de comunicação corporativa em massa via Teams (10k–100k+ usuários), as alternativas comumente tentadas têm limitações:
 
-Antes de utilizar qualquer parte deste projeto em um ambiente produtivo ou crítico, é essencial revisar, validar, proteger e adaptar o código conforme os requisitos da sua organização, incluindo:
+| Abordagem | Limitação |
+|---|---|
+| **Power Automate / Power Platform** | Throttling agressivo (~6k chamadas/dia por conexão), custo por execução, latência alta em massa. |
+| **Microsoft Graph (chats / messages)** | Limites por app e por usuário, criação de chat 1:1 é cara, geralmente pensada para uso interativo. |
+| **Bot Framework — proactive messaging** | Canal **projetado** para esse caso. Throughput sustentado de ~50 msg/s por bot, com fan-out por workers. |
 
-- Segurança
-- Escalabilidade
-- Confiabilidade
-- Monitoramento
-- Observabilidade
-- Custos
-- Conformidade
-
-Leia também:
-
-- [DISCLAIMER.md](./DISCLAIMER.md)
-- [SUPPORT.md](./SUPPORT.md)
+Esta demo **não burla rate limits** — usa o canal certo. O envio depende do Teams App estar instalado para cada usuário (org-wide via Admin Center), o que faz o bot capturar uma `conversationReference` por usuário e usá-la depois para mandar mensagens 1:1 sem nova interação.
 
 ---
 
 ## Índice
 
-- [O que este exemplo demonstra](#o-que-este-exemplo-demonstra)
 - [Arquitetura](#arquitetura)
-- [Fluxo de Funcionamento](#fluxo-de-funcionamento)
-- [Recursos Azure Necessários](#recursos-azure-necessários)
-- [Permissões Necessárias](#permissões-necessárias)
-- [Estrutura do Projeto](#estrutura-do-projeto)
-- [Pré-requisitos](#pré-requisitos)
-- [Como iniciar](#como-iniciar)
-- [Referência da API](#referência-da-api)
+- [Componentes Azure](#componentes-azure)
+- [Fluxo de funcionamento](#fluxo-de-funcionamento)
+- [Endpoints da API](#endpoints-da-api)
+- [Segurança](#segurança)
+- [Estrutura do projeto](#estrutura-do-projeto)
+- [Como iniciar (dev local)](#como-iniciar-dev-local)
+- [Deploy em Azure](#deploy-em-azure)
 - [Deploy do Teams App](#deploy-do-teams-app)
-- [Escalabilidade e Performance](#escalabilidade-e-performance)
-- [Testes de Carga](#testes-de-carga)
+- [Benchmarks](#benchmarks)
+- [Roadmap (não implementado)](#roadmap-não-implementado)
 - [Troubleshooting](#troubleshooting)
-
----
-
-## O que este exemplo demonstra
-
-- ✅ Envio de mensagens proativas 1:1 em massa via Microsoft Teams
-- ✅ Bot Framework Adapter com SingleTenant authentication
-- ✅ Armazenamento de conversation references via Azure Table Storage
-- ✅ Enfileiramento assíncrono de mensagens via Azure Service Bus
-- ✅ Worker containerizado (Docker) com auto-scaling via KEDA
-- ✅ Scale-to-zero — workers só rodam quando há mensagens na fila
-- ✅ Retry com backoff exponencial para throttling (429) e erros (5xx)
-- ✅ Acompanhamento de progresso em tempo real (job tracking)
-- ✅ Optimistic concurrency (ETag) para atualizações concorrentes
-- ✅ Script CLI para disparo em massa (`npm run send -- "mensagem"`)
-- ✅ Testes de carga (síncrono e assíncrono)
 
 ---
 
 ## Arquitetura
 
-### Visão de Alto Nível
-
 ```mermaid
 graph LR
-    A[Aplicação Cliente] -->|POST /api/send| B[API Server<br/>Container Apps]
-    B -->|Salva refs| C[(Table Storage<br/>conversationrefs)]
-    B -->|Enfileira N msgs| D[Service Bus<br/>Queue]
-    D -->|KEDA trigger| E[ACA Worker<br/>0-10 réplicas]
-    E -->|Bot Framework SDK| F[Bot Framework<br/>Service]
-    F -->|1:1 message| G[👤 Usuário 1]
-    F -->|1:1 message| H[👤 Usuário 2]
-    F -->|1:1 message| I[👤 Usuário N]
-    E -->|Atualiza progresso| J[(Table Storage<br/>jobs)]
-    A -->|GET /api/jobs/:id| B
-    B -->|Consulta progresso| J
+    A[Aplicação Cliente] -->|POST /api/send<br/>x-api-key| B[API ACA<br/>ingress externo]
+    B -->|saveRef + SADD| C[(Table Storage<br/>conversationrefs)]
+    B -->|fan-out: jobId+rowKey| D[Service Bus<br/>send-messages]
+    B -->|HMSET job:id| R[(Redis<br/>counters + msg)]
+    D -->|KEDA scaler| E[ACA Worker<br/>0-10 réplicas]
+    E -->|HGET msg + GET ref| R
+    E -->|continueConversation| F[Bot Framework]
+    F -->|1:1 message| G[👤 N usuários]
+    E -->|HINCRBY sent/failed| R
+    E -->|deleteEntity em 403/410| C
+    A -->|GET /api/jobs/:id<br/>x-api-key| B
+    B -->|HGETALL job:id| R
 ```
 
-### Visão Detalhada dos Componentes
+**Princípios:**
 
-```mermaid
-graph TB
-    subgraph "Microsoft Teams"
-        U1[👤 Usuário instala o app]
-        U2[👤 Usuário recebe mensagem]
-    end
-
-    subgraph "ACA Environment"
-        API[API Server :3978<br/>minReplicas: 1<br/>ingress: external]
-        BOT[ProactiveBot<br/>ActivityHandler]
-        ENQ[Message Enqueuer]
-        K[KEDA Scaler<br/>messageCount ≥ 5]
-        W1[Worker 1]
-        W2[Worker 2]
-        WN[Worker N<br/>minReplicas: 0]
-    end
-
-    subgraph "Armazenamento"
-        TS1[(Table: conversationrefs<br/>userId → conversationReference)]
-        TS2[(Table: jobs<br/>jobId → progresso)]
-    end
-
-    subgraph "Fila de Mensagens"
-        SB[Azure Service Bus<br/>Queue: send-messages<br/>Dead-letter habilitado]
-    end
-
-    subgraph "Microsoft"
-        BF[Bot Framework Service]
-        TMS[Teams Service]
-    end
-
-    U1 -->|conversationUpdate| API
-    API --> BOT
-    BOT -->|salva ref| TS1
-
-    API -->|POST /api/send| ENQ
-    ENQ -->|cria job| TS2
-    ENQ -->|enfileira N msgs| SB
-
-    SB --> K
-    K -->|scale 0→10| W1
-    K -->|scale 0→10| W2
-    K -->|scale 0→10| WN
-
-    W1 -->|continueConversation| BF
-    W2 -->|continueConversation| BF
-    WN -->|continueConversation| BF
-
-    BF --> TMS --> U2
-
-    W1 -->|incrementa progresso| TS2
-    W2 -->|incrementa progresso| TS2
-    WN -->|incrementa progresso| TS2
-```
+- **Redis = caminho quente** — counters atômicos (HINCRBY), index de refs ativos (SCARD), cache do payload da mensagem.
+- **Table Storage = durabilidade** — fonte da verdade das `conversationReferences`.
+- **Service Bus = fan-out** — desacopla API de workers, permite KEDA scale-to-zero, dead-letter para falhas permanentes.
+- **ACA = compute** — API com `minReplicas=1` (sempre ouvindo eventos do Teams) + Worker com `minReplicas=0` (custo zero quando ocioso).
 
 ---
 
-## Fluxo de Funcionamento
+## Componentes Azure
 
-### Fase 1 — Registro de Usuários
+| Recurso | SKU | Função | Custo aprox. |
+|---|---|---|---|
+| App Registration | Free | Identidade do bot (SingleTenant) | $0 |
+| Azure Bot | F0 | Registro Bot Framework + canal Teams | $0 |
+| Container Apps (API) | Consumption | Ingress externo, `minReplicas=1` | ~US$ 5/mês |
+| Container Apps (Worker) | Consumption | KEDA scale-to-zero, 0–10 réplicas | pay-per-use |
+| Service Bus | Basic | Fila + dead-letter | ~US$ 0.05/mês |
+| Table Storage | Standard LRS | Refs duráveis | ~US$ 0.01/mês |
+| Azure Cache for Redis | C0 Basic | Counters + refs index + msg cache | ~US$ 16/mês |
+| Container Registry | Basic | Imagens API + Worker | ~US$ 5/mês |
+| Log Analytics | Pay-per-GB (cap 25MB/d) | Logs ACA | ~US$ 2/mês |
 
-Quando o Teams App é instalado para um usuário (org-wide ou individualmente), o bot captura e armazena o `conversationReference` — um token que permite enviar mensagens para aquele usuário posteriormente, sem necessidade de interação.
+> 💡 Custo total de uma demo: ~**US$ 28/mês**. Workers só geram custo quando há mensagens na fila.
+
+---
+
+## Fluxo de funcionamento
+
+### Fase 1 — Registro de usuários (passivo)
 
 ```mermaid
 sequenceDiagram
     participant Admin as Teams Admin
     participant Teams as Microsoft Teams
-    participant API as API Server
-    participant Store as Table Storage
+    participant API as API ACA
+    participant Table as Table Storage
+    participant Redis as Redis
 
-    Admin->>Teams: Deploy do app org-wide
-    Teams->>Teams: Instala app para cada usuário
-
-    loop Para cada usuário
-        Teams->>API: POST /api/messages<br/>(evento conversationUpdate)
-        API->>API: Extrai conversationReference
-        API->>Store: Salva ref (userId → ref)
-        API-->>Teams: 200 OK
+    Admin->>Teams: Deploy do app (org-wide)
+    loop para cada usuário
+        Teams->>API: POST /api/messages (conversationUpdate)
+        API->>API: extrai conversationReference
+        API->>Table: upsertEntity (refs partition)
+        API->>Redis: SADD refs:active rowKey
     end
-
-    Note over Store: N conversation<br/>references armazenadas
+    Note over Table,Redis: N refs duráveis<br/>+ index O(1) para contagem
 ```
 
-### Fase 2 — Envio de Mensagens
-
-Quando a aplicação cliente dispara um envio, a API enfileira uma mensagem por usuário no Service Bus e retorna um job ID imediatamente. Os workers processam a fila em paralelo.
+### Fase 2 — Disparo do comunicado
 
 ```mermaid
 sequenceDiagram
-    participant Client as Aplicação Cliente
-    participant API as API Server
-    participant Store as Table Storage
+    participant Client as App cliente
+    participant API as API ACA
+    participant Table as Table Storage
+    participant Redis as Redis
     participant SB as Service Bus
-    participant Worker as ACA Workers (0→N)
+    participant Worker as Worker (0→N via KEDA)
     participant Bot as Bot Framework
-    participant Teams as Teams
+    participant User as 👤 usuário
 
-    Client->>API: POST /api/send<br/>{"message": "..."}
-    API->>Store: Carrega todas as refs
-    Store-->>API: N refs
-    API->>Store: Cria registro do job
-    API->>SB: Enfileira N mensagens<br/>(batches de 250)
-    API-->>Client: 202 {"jobId": "abc-123",<br/>"total": N, "status": "queued"}
+    Client->>API: POST /api/send (x-api-key)
+    API->>Table: getAllRefs
+    API->>Redis: HMSET job:id (msg + counters)
+    API->>SB: enfileira N msgs (jobId + refJson + rowKey)
+    API-->>Client: 202 {jobId, total, statusUrl}
 
-    Note over SB,Worker: KEDA detecta profundidade da fila<br/>→ escala workers de 0 → 10
+    Note over SB,Worker: KEDA detecta queue depth → escala 0→10
 
-    par Workers 1..N processam em paralelo
-        Worker->>SB: Recebe mensagem
+    par workers em paralelo
+        Worker->>SB: receive
+        Worker->>Redis: HGET job:id message (1x por job, cacheado)
         Worker->>Bot: continueConversation(ref, msg)
-        Bot->>Teams: Entrega mensagem 1:1
-        Teams->>Teams: 👤 Usuário vê a notificação
-        Worker->>Store: incrementJobProgress(jobId, success)
+        Bot->>User: mensagem 1:1
+        alt sucesso
+            Worker->>Redis: HINCRBY sent
+        else 403/410 (bot bloqueado/desinstalado)
+            Worker->>Table: deleteEntity rowKey
+            Worker->>Redis: SREM refs:active + HINCRBY failed
+        else 429/5xx
+            Worker->>Worker: backoff/retry
+        end
     end
 
-    Client->>API: GET /api/jobs/abc-123
-    API->>Store: Lê progresso do job
-    Store-->>API: {sent: 35200, failed: 12}
-    API-->>Client: {"progress": 88, "status": "processing"}
-
-    Note over Worker: Todas as mensagens processadas
-
-    Client->>API: GET /api/jobs/abc-123
-    API-->>Client: {"progress": 100,<br/>"status": "completed"}
-
-    Note over Worker: KEDA cooldown (300s)<br/>→ escala workers de 10 → 0
+    Client->>API: GET /api/jobs/:id
+    API->>Redis: HGETALL job:id
+    API-->>Client: {progress, sent, failed, status}
 ```
 
-### Fase 3 — Tratamento de Erros
+### Fase 3 — Tratamento de erros
 
 ```mermaid
 flowchart TD
-    A[Worker recebe mensagem] --> B{Envia via Bot Framework}
-    B -->|✅ 200 OK| C[Atualiza job: sent++]
-    B -->|⚠️ 429 Throttled| D[Aguarda retry-after]
+    A[Worker recebe mensagem] --> B{continueConversation}
+    B -->|✅ 200| C[HINCRBY sent]
+    B -->|⚠️ 429| D[Retry após Retry-After]
     D --> B
-    B -->|⚠️ 5xx Erro do servidor| E[Backoff exponencial]
+    B -->|⚠️ 5xx| E[Backoff exponencial]
     E --> B
-    B -->|❌ 403 Bloqueado| F[Atualiza job: failed++<br/>Usuário bloqueou/desinstalou o bot]
-    B -->|❌ Outro erro| G{Tentativas restantes?}
-    G -->|Sim| E
-    G -->|Não| H[Mensagem → Dead-letter queue]
+    B -->|❌ 403/410| F[Remove ref<br/>HINCRBY failed]
+    B -->|❌ 4xx outro| G[HINCRBY failed<br/>permanente]
+    B -->|❌ erro transitório<br/>retries esgotados| H[throw → SB redeliver<br/>até dead-letter]
 
     style C fill:#4CAF50,color:#fff
     style F fill:#FF9800,color:#fff
+    style G fill:#FF9800,color:#fff
     style H fill:#f44336,color:#fff
 ```
 
 ---
 
-## Recursos Azure Necessários
+## Endpoints da API
 
-| Recurso | SKU | Finalidade | Custo Estimado |
-|---------|-----|-----------|----------------|
-| **App Registration** | Gratuito | Identidade do bot (SingleTenant) | Grátis |
-| **Azure Bot** | F0 (Gratuito) | Registro no Bot Framework + canal Teams | Grátis |
-| **Container Apps** | Consumption | API Server (minReplicas: 1, ingress externo) | ~US$ 5/mês |
-| **Container Apps** | Consumption | Workers KEDA (scale-to-zero, 0-10 réplicas) | Pay-per-use |
-| **Service Bus** | Basic | Fila de mensagens com dead-letter e retry | ~US$ 0,05/mês |
-| **Table Storage** | Standard LRS | Conversation references (durável, 50K+ docs) | ~US$ 0,01/mês |
-| **Azure Cache for Redis** | C0 (Basic) | Job counters atômicos (HINCRBY, sem race conditions) | ~US$ 16/mês |
-| **Container Registry** | Basic | Imagens Docker (API + worker) | ~US$ 5/mês |
-| **Log Analytics** | Pay-per-GB | Logs do ACA (configure daily cap) | ~US$ 2/mês |
+| Método | Path | Auth | Descrição |
+|---|---|---|---|
+| POST | `/api/messages` | Bot Framework token | Endpoint do Bot Framework (configure como Messaging Endpoint no Azure Bot) |
+| POST | `/api/send` | `x-api-key` | Enfileira N mensagens, retorna `202 Accepted` |
+| GET | `/api/jobs/:id` | `x-api-key` | Progresso do job (Redis) |
+| GET | `/api/status` | `x-api-key` | Contagem de usuários registrados |
+| GET | `/healthz` | — | Liveness simples |
+| GET | `/readyz` | — | Readiness (Redis + Storage) |
 
-> 💡 **Custo total estimado**: ~US$ 28/mês. Workers geram custo apenas quando estão enviando. Tudo roda no mesmo ACA Environment.
+### `POST /api/send`
+
+```http
+POST /api/send
+Content-Type: application/json
+x-api-key: <API_KEY>
+
+{ "message": "📢 Comunicado importante para todos os colaboradores!" }
+```
+
+```json
+HTTP/1.1 202 Accepted
+{
+  "jobId": "d836...",
+  "total": 50000,
+  "enqueued": 50000,
+  "status": "queued",
+  "statusUrl": "/api/jobs/d836..."
+}
+```
+
+### `GET /api/jobs/:id`
+
+```json
+{
+  "jobId": "d836...",
+  "message": "📢 Comunicado importante para todos os colaboradores!",
+  "total": 50000,
+  "sent": 49988,
+  "failed": 12,
+  "status": "completed",
+  "progress": 100,
+  "createdAt": "...",
+  "updatedAt": "...",
+  "errors": ["Usuário bloqueou/desinstalou o bot", "..."]
+}
+```
+
+| `status` | Significado |
+|---|---|
+| `queued` | Job criado, mensagens sendo enfileiradas |
+| `processing` | Workers estão enviando |
+| `completed` | Todas processadas (enviadas + falhadas = total) |
 
 ---
 
-## Permissões Necessárias
+## Segurança
 
-### Azure (para deploy)
-
-| Permissão | Escopo | Finalidade |
-|-----------|--------|-----------|
-| `Contributor` | Resource Group | Criar/gerenciar todos os recursos Azure |
-| `User Access Administrator` | Resource Group | Atribuir managed identities (se usar MSI) |
-
-### Microsoft Entra ID (App Registration)
-
-| Configuração | Tipo | Finalidade |
-|-------------|------|-----------|
-| `SingleTenant` App Registration | Application | Autenticação do bot com o Bot Framework |
-| Client Secret | Credential | Autenticação programática |
-| Service Principal | Enterprise App | Necessário no tenant para obter tokens |
-
-### Microsoft Teams (Admin Center)
-
-| Permissão | Finalidade |
-|-----------|-----------|
-| **Teams Administrator** | Upload do app customizado no catálogo da organização |
-| **Teams Administrator** | Configurar políticas para instalação org-wide |
-
-### Permissões no Manifest (Teams App)
-
-| Permissão | Finalidade |
-|-----------|-----------|
-| `identity` | Identificar usuários nas conversas |
-| `messageTeamMembers` | Enviar mensagens proativas para membros |
+- `POST /api/send`, `GET /api/jobs/:id`, `GET /api/status` exigem header `x-api-key` quando `API_KEY` está definida.
+- **Em dev local**, deixar `API_KEY` vazia desliga a checagem (a API loga um warning ao iniciar).
+- **Em produção / cliente**, considere alternativas mais robustas (em ordem de robustez):
+  - Entra ID com client credentials + JWT bearer + middleware de validação;
+  - APIM como front-door com policies;
+  - ACA com ingress interno + APIM/AGW público;
+  - mTLS ou IP allowlist via NSG.
+- Secrets sensíveis (`MICROSOFT_APP_PASSWORD`, `SERVICE_BUS_CONNECTION`, `STORAGE_CONNECTION`, `REDIS_CONNECTION`, `API_KEY`) devem ir em **ACA secrets** ou **Key Vault** com Managed Identity, nunca em env vars planas.
 
 ---
 
-## Estrutura do Projeto
+## Estrutura do projeto
 
 ```
-teams-proactive-messaging/
-│
-├── src/                        # API Server (Container Apps)
-│   ├── index.ts                # Servidor Express + endpoints REST
-│   ├── bot.ts                  # ProactiveBot — captura conversationReferences
-│   ├── table-store.ts          # Client Azure Table Storage (refs + jobs)
-│   ├── sender.ts               # Sender síncrono (para uso em pequena escala)
-│   ├── send-bulk.ts            # Ferramenta CLI para envio direto
-│   └── store.ts                # Store em arquivo JSON (dev/teste)
-├── Dockerfile                  # Dockerfile da API
-├── .dockerignore
-│
-├── worker/                     # ACA Worker (Container Apps)
+teams_msgs/
+├── src/                       # API (ACA, ingress externo)
+│   ├── index.ts               # Express + endpoints + auth + healthz/readyz
+│   ├── bot.ts                 # ProactiveBot (captura conversationReferences)
+│   ├── table-store.ts         # Refs duráveis em Table Storage + sincroniza Redis SET
+│   └── redis-tracker.ts       # Job counters + refs index + cache da mensagem
+├── worker/                    # Worker (ACA, KEDA scale-to-zero)
 │   ├── src/
-│   │   ├── index.ts            # Ponto de entrada
-│   │   ├── worker.ts           # Consumer do Service Bus + sender Bot Framework
-│   │   └── job-tracker.ts      # Tracker de progresso (optimistic concurrency)
-│   ├── Dockerfile              # Build multi-stage (builder + runtime)
-│   ├── .dockerignore
-│   ├── package.json
-│   └── tsconfig.json
-│
-├── manifest/                   # Pacote do Teams App
-│   ├── manifest.json           # Manifest do app (editar placeholders)
-│   ├── color.png               # Ícone 192x192
-│   └── outline.png             # Ícone 32x32
-│
-├── load_test/                  # Scripts de Teste de Carga
-│   ├── run.js                  # Teste síncrono
-│   └── run-async.js            # Teste assíncrono (via fila)
-│
-├── .env.example                # Template de variáveis de ambiente
-├── .gitignore
+│   │   ├── index.ts           # bootstrap
+│   │   ├── worker.ts          # Service Bus consumer + Bot Framework sender
+│   │   ├── redis-tracker.ts   # incrementSent/Failed + getJobMessage
+│   │   └── table-store.ts     # removeRefByRowKey (limpeza em 403/410)
+│   └── Dockerfile
+├── manifest/                  # Pacote Teams App
+│   ├── manifest.json
+│   ├── color.png              # 192x192
+│   └── outline.png            # 32x32
+├── load_test/
+│   ├── run-50k.js             # Single-job, N usuários simulados
+│   └── run-waves.js           # Waves sequenciais (cold start vs warm)
+├── Dockerfile                 # API
+├── .env.example
 ├── package.json
 ├── tsconfig.json
 ├── DISCLAIMER.md
 ├── SUPPORT.md
+├── LICENSE
 └── README.md
 ```
 
 ---
 
-## Pré-requisitos
-
-- [Node.js](https://nodejs.org) 20+
-- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
-- Uma Subscription Azure
-- Acesso de Teams Admin (para publicar o app)
-
----
-
-## Como iniciar
-
-### 1. Clone e instale
+## Como iniciar (dev local)
 
 ```bash
 git clone https://github.com/EdneiMonteiro/teams_msgs.git
 cd teams_msgs
 npm install
 cd worker && npm install && cd ..
-```
+cp .env.example .env       # edite com seus valores
+npm run dev                # API em http://localhost:3978
 
-### 2. Configure o ambiente
-
-```bash
-cp .env.example .env
-# Edite .env com suas credenciais Azure
-```
-
-### 3. Execute localmente (desenvolvimento)
-
-```bash
-npm run dev
-
-# Exponha via ngrok para receber eventos do Teams:
+# Em outro terminal — expõe o endpoint para o Bot Framework:
 ngrok http 3978
-
-# Configure o Messaging Endpoint no Azure Bot:
-# https://<ngrok-url>/api/messages
+# → atualize o Messaging Endpoint do Azure Bot para https://<ngrok>/api/messages
 ```
 
-### 4. Deploy
-
-Todos os componentes rodam no mesmo **ACA Environment**:
-
-#### Criar infraestrutura
-
-```bash
-# Resource group + Service Bus + Storage + ACR
-az group create --name rg-teams-msgs --location eastus2
-az servicebus namespace create --resource-group rg-teams-msgs --name sb-my-msgs --sku Basic
-az servicebus queue create --resource-group rg-teams-msgs --namespace-name sb-my-msgs \
-  --name send-messages --max-delivery-count 5
-az storage account create --resource-group rg-teams-msgs --name stmymsgs --sku Standard_LRS
-az acr create --resource-group rg-teams-msgs --name acrmymsgs --sku Basic --admin-enabled true
-
-# ACA Environment (compartilhado)
-az containerapp env create --resource-group rg-teams-msgs --name aca-env --location eastus2
-```
-
-#### API → Container Apps (ingress externo, always-on)
-
-```bash
-# Build imagem da API
-az acr build --registry acrmymsgs --image teams-msgs-api:v1 --file Dockerfile .
-
-# Deploy com ingress externo
-az containerapp create \
-  --resource-group rg-teams-msgs \
-  --name api-msgs \
-  --environment aca-env \
-  --image acrmymsgs.azurecr.io/teams-msgs-api:v1 \
-  --min-replicas 1 --max-replicas 3 \
-  --ingress external --target-port 3978 \
-  --env-vars "MICROSOFT_APP_ID=<app-id>" \
-             "MICROSOFT_APP_TENANT_ID=<tenant-id>" \
-             "PORT=3978"
-  # + secrets para SERVICE_BUS_CONNECTION, STORAGE_CONNECTION, MICROSOFT_APP_PASSWORD
-
-# Atualizar messaging endpoint no bot
-az bot update --resource-group rg-teams-msgs --name my-bot \
-  --endpoint "https://<api-fqdn>/api/messages"
-```
-
-#### Worker → Container Apps (KEDA, scale-to-zero)
-
+Para rodar o worker localmente (apontando para Redis/Service Bus reais):
 ```bash
 cd worker
-
-# Build imagem do worker
-az acr build --registry acrmymsgs --image teams-msgs-worker:v1 --file Dockerfile .
-
-# Deploy com KEDA Service Bus scaler
-az containerapp create \
-  --resource-group rg-teams-msgs \
-  --name worker-msgs \
-  --environment aca-env \
-  --image acrmymsgs.azurecr.io/teams-msgs-worker:v1 \
-  --min-replicas 0 --max-replicas 10 \
-  --env-vars "MICROSOFT_APP_ID=<app-id>" \
-             "MICROSOFT_APP_TENANT_ID=<tenant-id>" \
-             "MAX_CONCURRENT=10"
-  # + secrets + scale-rule-* (ver seção Escalabilidade)
+npm run build && npm start
 ```
 
 ---
 
-## Referência da API
+## Deploy em Azure
 
-### `POST /api/messages`
+```bash
+RG=rg-teams-msgs
+LOC=eastus2
+ACR=acrteamsmsgs
 
-Endpoint do Bot Framework. Recebe eventos de atividade do Teams (instalações, mensagens, etc.). Esta URL deve ser configurada como **Messaging Endpoint** no Azure Bot.
+# Resource group + recursos base
+az group create -n $RG -l $LOC
+az servicebus namespace create -g $RG -n sb-teams-msgs --sku Basic
+az servicebus queue create -g $RG --namespace-name sb-teams-msgs \
+  -n send-messages --max-delivery-count 5
+az storage account create -g $RG -n stteamsmsgs --sku Standard_LRS
+az redis create -g $RG -n redis-teams-msgs -l $LOC --sku Basic --vm-size c0
+az acr create -g $RG -n $ACR --sku Basic --admin-enabled true
 
-### `POST /api/send`
+# ACA Environment compartilhado
+az containerapp env create -g $RG -n aca-teams-msgs -l $LOC
 
-Envia uma mensagem para todos os usuários registrados. Retorna imediatamente com um job ID.
+# Build das imagens
+az acr build -r $ACR -t teams-msgs-api:v1 -f Dockerfile .
+az acr build -r $ACR -t teams-msgs-worker:v1 -f worker/Dockerfile worker/
 
-**Request:**
-```json
-{
-  "message": "📢 Comunicado importante para todos os colaboradores!"
-}
-```
+# Deploy API (ingress externo, always-on)
+az containerapp create -g $RG -n api-teams-msgs \
+  --environment aca-teams-msgs \
+  --image $ACR.azurecr.io/teams-msgs-api:v1 \
+  --min-replicas 1 --max-replicas 3 \
+  --ingress external --target-port 3978 \
+  --secrets sb-conn=<sb> storage-conn=<st> redis-conn=<redis> \
+            app-pwd=<bot> api-key=<random> \
+  --env-vars MICROSOFT_APP_ID=<id> MICROSOFT_APP_TENANT_ID=<tenant> \
+             PORT=3978 \
+             SERVICE_BUS_CONNECTION=secretref:sb-conn \
+             STORAGE_CONNECTION=secretref:storage-conn \
+             REDIS_CONNECTION=secretref:redis-conn \
+             MICROSOFT_APP_PASSWORD=secretref:app-pwd \
+             API_KEY=secretref:api-key
 
-**Response (202):**
-```json
-{
-  "jobId": "d83627e6-b79c-4dd3-b311-52b2855d2dee",
-  "total": 5000,
-  "status": "queued",
-  "statusUrl": "/api/jobs/d83627e6-b79c-4dd3-b311-52b2855d2dee"
-}
-```
+# Atualizar Messaging Endpoint do Azure Bot
+az bot update -g $RG -n teams-proactive-msgs-bot \
+  --endpoint "https://<api-fqdn>/api/messages"
 
-### `GET /api/jobs/:id`
-
-Consulta o progresso de um job de envio em tempo real.
-
-**Response:**
-```json
-{
-  "jobId": "d83627e6-b79c-4dd3-b311-52b2855d2dee",
-  "status": "processing",
-  "total": 5000,
-  "sent": 4800,
-  "failed": 12,
-  "progress": 88,
-  "createdAt": "2026-05-06T20:22:12.921Z",
-  "updatedAt": "2026-05-06T20:25:01.443Z",
-  "errors": ["Usuário bloqueou o bot", "..."]
-}
-```
-
-| Status | Descrição |
-|--------|-----------|
-| `queued` | Job criado, mensagens sendo enfileiradas no Service Bus |
-| `processing` | Workers estão ativamente enviando mensagens |
-| `completed` | Todas as mensagens foram processadas (enviadas ou falharam) |
-
-### `GET /api/status`
-
-Health check do serviço e contagem de usuários.
-
-**Response:**
-```json
-{
-  "registeredUsers": 5000,
-  "status": "running",
-  "mode": "queue"
-}
+# Deploy Worker (KEDA scale-to-zero)
+az containerapp create -g $RG -n worker-teams-msgs \
+  --environment aca-teams-msgs \
+  --image $ACR.azurecr.io/teams-msgs-worker:v1 \
+  --min-replicas 0 --max-replicas 10 \
+  --secrets sb-conn=<sb> storage-conn=<st> redis-conn=<redis> app-pwd=<bot> \
+  --env-vars MICROSOFT_APP_ID=<id> MICROSOFT_APP_TENANT_ID=<tenant> \
+             MAX_CONCURRENT=10 \
+             SERVICE_BUS_CONNECTION=secretref:sb-conn \
+             STORAGE_CONNECTION=secretref:storage-conn \
+             REDIS_CONNECTION=secretref:redis-conn \
+             MICROSOFT_APP_PASSWORD=secretref:app-pwd \
+  --scale-rule-name sb-queue \
+  --scale-rule-type azure-servicebus \
+  --scale-rule-metadata queueName=send-messages messageCount=5 \
+  --scale-rule-auth connection=sb-conn
 ```
 
 ---
 
 ## Deploy do Teams App
 
-### 1. Edite o manifest
-
-Abra `manifest/manifest.json` e substitua os placeholders:
-
-| Placeholder | Substituir por |
-|------------|----------------|
-| `<MICROSOFT_APP_ID>` | Client ID do seu App Registration |
-| `<your-app-service>` | FQDN do ACA API (ex: `api-msgs.gentledune-xxx.eastus2.azurecontainerapps.io`) |
-
-### 2. Empacote o app
-
-```bash
-cd manifest
-zip ../teams-app.zip manifest.json color.png outline.png
-```
-
-### 3. Upload no Teams Admin Center
-
-1. Acesse [https://admin.teams.microsoft.com](https://admin.teams.microsoft.com)
-2. Navegue até **Aplicativos do Teams → Gerenciar aplicativos → ⬆ Carregar novo aplicativo**
-3. Faça upload do `teams-app.zip`
-
-### 4. Deploy org-wide
-
-1. Vá em **Aplicativos do Teams → Configurar políticas**
-2. Clique em **Global (padrão de toda a organização)**
-3. Em **Aplicativos instalados**, clique em **+ Adicionar aplicativos**
-4. Busque o app e adicione
-5. Clique em **Salvar**
-
-> ⏱️ O deploy org-wide pode levar **24–48 horas** para atingir todos os usuários. Para testes imediatos, instale manualmente pelo Teams em "Criado para sua organização".
+1. Edite `manifest/manifest.json` substituindo `<MICROSOFT_APP_ID>` e `<your-api-fqdn>`.
+2. Empacote: `cd manifest && zip ../teams-app.zip manifest.json color.png outline.png`
+3. Suba em **Teams Admin Center → Manage apps → Upload new app**.
+4. **Setup policies → Global → Installed apps → Add apps** (org-wide).
+5. Propagação org-wide leva 24–48h. Para testes imediatos, instale manualmente em **Apps → Built for your org**.
 
 ---
 
-## Escalabilidade e Performance
+## Benchmarks
 
-### Auto-scaling com KEDA
-
-O worker ACA usa [KEDA](https://keda.sh/) para escalar baseado na profundidade da fila do Service Bus:
-
-```mermaid
-graph LR
-    subgraph "Fila vazia"
-        Q0[Service Bus<br/>0 mensagens] --> W0[Workers: 0<br/>💤 Scale to zero]
-    end
-
-    subgraph "Carga baixa"
-        Q1[Service Bus<br/>100 mensagens] --> W1[Workers: 1<br/>⚡ Processando]
-    end
-
-    subgraph "Carga média"
-        Q2[Service Bus<br/>5.000 mensagens] --> W2[Workers: 5<br/>⚡⚡⚡ Paralelo]
-    end
-
-    subgraph "Carga alta"
-        Q3[Service Bus<br/>N mensagens] --> W3[Workers: 10<br/>🔥 Throughput máximo]
-    end
-```
-
-### Benchmarks de Performance
-
-Resultados obtidos em testes de carga com 1 worker ACA (0.5 vCPU, 1Gi), Redis C0, Table Storage, Service Bus Basic:
+Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic.
 
 | Refs | Total Msgs | Sent | Failed | Enqueue | Processing | Throughput |
-|------|-----------|------|--------|---------|-----------|------------|
+|---:|---:|---:|---:|---:|---:|---:|
 | 500 | 502 | 502 | 0 | 0.9s | 50.7s | 595 msg/min ¹ |
 | 1.000 | 1.002 | 1.002 | 0 | 0.7s | 3.2s | 18.953 msg/min |
 | 10.000 | 10.002 | 10.002 | 0 | 16.5s | 12.9s | 46.481 msg/min |
 | 15.000 | 15.002 | 15.002 | 0 | 13.2s | 57.5s | 15.654 msg/min ¹ |
 | **50.000** | **50.002** | **50.002** | **0** | **45.3s** | **96.9s** | **30.976 msg/min** |
 
-> ¹ Throughput menor nas waves 500 e 15K devido ao cold start do KEDA (scale-to-zero → primeiro container demora ~45s para iniciar).
->
-> 📌 Com o worker já "quente" (réplica ativa), o throughput sustentado fica entre **15.000–46.000 msg/min** dependendo da carga.
+¹ Throughput menor por cold start do KEDA (scale-to-zero → primeiro container demora ~45s para subir).
 
-### Como os números se traduzem na prática
-
-| Usuários | Enqueue | Processamento | Total |
-|----------|---------|--------------|-------|
-| 1.000 | ~1s | ~3s | **~4s** |
-| 10.000 | ~17s | ~13s | **~30s** |
-| 50.000 | ~45s | ~97s | **~2.5 min** |
-
-> ⚠️ **Limite do Bot Framework**: ~50 msg/s por bot antes de throttling pesado. Com múltiplos workers o throughput pode ser maior, mas o Bot Service é o gargalo final.
-
-### Variáveis de Configuração
-
-| Variável | Default | Descrição |
-|----------|---------|-----------|
-| `MAX_CONCURRENT` | 10 | Mensagens concorrentes por réplica do worker |
-| `QUEUE_NAME` | send-messages | Nome da fila no Service Bus |
+> 📌 Os números acima usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out e job tracking, mas **não exercitam o Bot Framework de verdade** para 50k usuários distintos. Em cenário real, o **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot). Para 100k+, é esperado:
+> - Throughput sustentado de ~3.000 msg/min por bot
+> - 100k mensagens em ~30–40 minutos com 1 bot
+> - Para janelas mais agressivas, paralelizar com múltiplos bots por audiência
 
 ---
 
-## Testes de Carga
+## Roadmap (não implementado nesta demo)
 
-### Teste síncrono (envio direto pela API)
+Items que fariam sentido em uma evolução para produção:
 
-```bash
-node load_test/run.js --requests 100 --concurrency 10 --delay 500
-```
-
-### Teste assíncrono (via fila — arquitetura de produção)
-
-```bash
-BOT_URL=https://<seu-app-fqdn> node load_test/run-async.js --jobs 100
-```
-
-Ambos os scripts exibem:
-- Progresso em tempo real
-- Resumo final (sucesso, falhas, throughput, latência)
-- Relatório JSON para análise
+- **Token bucket global no Redis** — limita o envio agregado por bot/tenant, independente do número de workers (KEDA escala compute, mas o teto real é o Bot Framework).
+- **Backpressure adaptativo** — reduzir concorrência por worker quando 429s aparecerem; aumentar quando 200s sustentados.
+- **Segmentação de audiência** — `POST /api/send` com filtro (lista CSV, departamento, país, tags).
+- **Adaptive Cards** — aceitar `message` como string OU `{type, content}` para Adaptive Card.
+- **Idempotência forte** — Service Bus Standard/Premium com duplicate detection (já populamos `messageId`).
+- **Reconciliação Redis ↔ Table** — job periódico para sincronizar `refs:active` SET com a tabela.
+- **Particionamento das refs** — distribuir entre múltiplas partitions por hash, evitando hot partition em Table Storage.
+- **Auditoria + governança** — modelo de "campanha" com owner, aprovação, dry-run, histórico.
+- **OIDC / Entra ID** — substituir `x-api-key` por validação de JWT.
 
 ---
 
 ## Troubleshooting
 
 | Sintoma | Causa | Solução |
-|---------|-------|---------|
-| `Authorization denied` no envio | Service Principal ausente | Execute `az ad sp create --id <app-id>` |
-| `Failed to decrypt conversation id` | Tipo do bot alterado após refs serem salvas | Delete refs antigas no Table Storage, reinstale o Teams app |
-| Workers não escalam | Regra KEDA mal configurada | Verifique com `az containerapp show` as scale rules |
-| `403 Forbidden` em alguns usuários | Usuário bloqueou ou desinstalou o bot | Normal — contabilizado como `failed` no progresso |
-| `429 Too Many Requests` | Throttling do Bot Framework | Workers fazem retry automático com backoff exponencial |
-| Job travado em < 100% | Race condition no progresso | Corrigido com ETag optimistic concurrency (v2+) |
+|---|---|---|
+| `Authorization denied` no envio | Service Principal ausente no tenant alvo | `az ad sp create --id <app-id>` |
+| `Failed to decrypt conversation id` | Tipo do bot foi alterado depois das refs serem salvas | Limpe a tabela `conversationrefs` e reinstale o Teams app |
+| `401 Unauthorized` em `/api/send` | `x-api-key` faltando ou divergente | Veja env var `API_KEY` na ACA |
+| Workers não escalam | Regra KEDA mal configurada | `az containerapp show` e verifique `scale.rules` |
+| `403 Forbidden` em alguns usuários | Usuário bloqueou ou desinstalou o bot | Normal — agora o worker remove a ref automaticamente |
+| `429 Too Many Requests` em volume | Throttling do Bot Framework | Workers fazem retry com `Retry-After`; reduza `MAX_CONCURRENT` se persistir |
+| `/readyz` retorna 503 | Redis ou Storage não acessíveis | Cheque connection strings e regras de firewall |
 
 ---
 
-## Suporte
+## Suporte e Aviso Legal
 
-Este projeto **não possui SLA nem suporte oficial**.
-
-Veja [SUPPORT.md](./SUPPORT.md) para detalhes.
-
-## Aviso Legal
-
-O uso deste projeto está sujeito aos termos descritos em [DISCLAIMER.md](./DISCLAIMER.md).
-
-## Contribuições
-
-Contribuições podem ser aceitas a critério do mantenedor.
-
-## Marcas Registradas (Trademarks)
-
-Os nomes e serviços da Microsoft são utilizados apenas para fins descritivos. Este projeto **não é afiliado, endossado ou suportado oficialmente pela Microsoft**.
+- Sem SLA nem suporte oficial. Veja [SUPPORT.md](./SUPPORT.md).
+- Uso sujeito a [DISCLAIMER.md](./DISCLAIMER.md).
+- **Não afiliado nem endossado pela Microsoft.** Marcas usadas apenas para descrição.

@@ -5,9 +5,9 @@
   "id": "<MICROSOFT_APP_ID>",
   "developer": {
     "name": "Your Company",
-    "websiteUrl": "https://<your-app-service>.azurewebsites.net",
-    "privacyUrl": "https://<your-app-service>.azurewebsites.net/privacy",
-    "termsOfUseUrl": "https://<your-app-service>.azurewebsites.net/terms"
+    "websiteUrl": "https://<your-api-fqdn>",
+    "privacyUrl": "https://<your-api-fqdn>/privacy",
+    "termsOfUseUrl": "https://<your-api-fqdn>/terms"
   },
   "name": {
     "short": "Notifications",
@@ -33,8 +33,9 @@
   ],
   "permissions": ["identity", "messageTeamMembers"],
   "validDomains": [
-    "<your-app-service>.azurewebsites.net"
+    "<your-api-fqdn>"
   ],
   "defaultInstallScope": "personal",
   "defaultGroupCapability": {}
 }
+

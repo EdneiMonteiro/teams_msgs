@@ -1,29 +1,68 @@
 // Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
 // See LICENSE and DISCLAIMER.md in the project root for details.
-import { ServiceBusClient, ServiceBusReceivedMessage, ProcessErrorArgs } from "@azure/service-bus";
-import { BotFrameworkAdapter, ConversationReference, TurnContext } from "botbuilder";
-import { incrementSent, incrementFailed } from "./redis-tracker";
+//
+// Service Bus consumer + Bot Framework sender.
+// - Lê o conteúdo da mensagem do Redis (1x por job, com cache local).
+// - Em 403/410, remove a ref inválida do Table Storage + Redis SET.
+// - Throttle 429 → respeita Retry-After.
+// - 5xx → backoff exponencial.
+// - Demais erros → throw para Service Bus retry / dead-letter.
+
+import {
+  ServiceBusClient,
+  ServiceBusReceivedMessage,
+  ProcessErrorArgs,
+} from "@azure/service-bus";
+import {
+  BotFrameworkAdapter,
+  ConversationReference,
+  TurnContext,
+} from "botbuilder";
+import {
+  incrementSent,
+  incrementFailed,
+  getJobMessage,
+} from "./redis-tracker";
+import { removeRefByRowKey } from "./table-store";
 
 interface QueueMessage {
   jobId: string;
   refJson: string;
-  message: string;
+  rowKey: string;
+  // Compatibilidade com mensagens antigas que carregavam o body inline:
+  message?: string;
 }
 
 const SB_CONNECTION = process.env.SERVICE_BUS_CONNECTION || "";
 const QUEUE_NAME = process.env.QUEUE_NAME || "send-messages";
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "10");
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "10", 10);
 
-// Bot Framework adapter (singleton, reutiliza token)
 const adapter = new BotFrameworkAdapter({
   appId: process.env.MICROSOFT_APP_ID || "",
   appPassword: process.env.MICROSOFT_APP_PASSWORD || "",
   channelAuthTenant: process.env.MICROSOFT_APP_TENANT_ID || "",
 });
 
-adapter.onTurnError = async (_context, error) => {
+adapter.onTurnError = async (_ctx, error) => {
   console.error(`[BOT ERRO] ${error.message}`);
 };
+
+// Cache em memória do payload da mensagem (1 leitura no Redis por job).
+const messageCache = new Map<string, { msg: string; expiresAt: number }>();
+const MESSAGE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function resolveMessage(body: QueueMessage): Promise<string> {
+  if (body.message) return body.message;
+  const cached = messageCache.get(body.jobId);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.msg;
+  const msg = await getJobMessage(body.jobId);
+  if (!msg) {
+    throw new Error(`Job ${body.jobId} não encontrado no Redis (expirou?)`);
+  }
+  messageCache.set(body.jobId, { msg, expiresAt: now + MESSAGE_CACHE_TTL_MS });
+  return msg;
+}
 
 let processedCount = 0;
 let errorCount = 0;
@@ -31,76 +70,131 @@ const startTime = Date.now();
 
 function logStats(): void {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-  const rate = processedCount > 0 ? (processedCount / ((Date.now() - startTime) / 60000)).toFixed(1) : "0";
-  console.log(`📊 [${elapsed}s] Processados: ${processedCount} | Erros: ${errorCount} | Rate: ${rate} msg/min`);
+  const rate =
+    processedCount > 0
+      ? (processedCount / ((Date.now() - startTime) / 60000)).toFixed(1)
+      : "0";
+  console.log(
+    `📊 [${elapsed}s] Processadas: ${processedCount} | Erros: ${errorCount} | Rate: ${rate} msg/min`
+  );
 }
 
-async function sendWithRetry(
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+interface SendOutcome {
+  ok: boolean;
+  permanent?: boolean;
+  statusCode?: number;
+  errorMsg?: string;
+}
+
+async function sendOnce(
   ref: ConversationReference,
-  message: string,
-  retries = 3
-): Promise<void> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+  message: string
+): Promise<SendOutcome> {
+  const RETRIES = 3;
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
     try {
-      await adapter.continueConversation(ref, async (context: TurnContext) => {
-        await context.sendActivity(message);
+      await adapter.continueConversation(ref, async (ctx: TurnContext) => {
+        await ctx.sendActivity(message);
       });
-      return;
+      return { ok: true };
     } catch (err: any) {
       const status = err.statusCode || 0;
 
-      if (status === 429 && attempt < retries) {
+      // 429 = throttle do Bot Framework
+      if (status === 429 && attempt < RETRIES) {
         const retryAfter = err.headers?.["retry-after"]
-          ? parseInt(err.headers["retry-after"]) * 1000
+          ? parseInt(err.headers["retry-after"], 10) * 1000
           : 1000 * Math.pow(2, attempt);
-        console.warn(`⏳ Throttled, retry #${attempt} em ${retryAfter}ms`);
+        console.warn(`⏳ 429 throttle, retry #${attempt} em ${retryAfter}ms`);
         await sleep(retryAfter);
         continue;
       }
 
-      if (status >= 500 && attempt < retries) {
+      // 5xx = erro transitório do servidor
+      if (status >= 500 && attempt < RETRIES) {
         const backoff = 500 * Math.pow(2, attempt);
-        console.warn(`⚠️ Server ${status}, retry #${attempt} em ${backoff}ms`);
+        console.warn(`⚠️ ${status}, retry #${attempt} em ${backoff}ms`);
         await sleep(backoff);
         continue;
       }
 
-      throw err;
+      // 403/410 = bot bloqueado / desinstalado / conversa morta → ref inválida
+      if (status === 403 || status === 410) {
+        return {
+          ok: false,
+          permanent: true,
+          statusCode: status,
+          errorMsg:
+            status === 403
+              ? "Usuário bloqueou/desinstalou o bot"
+              : "Conversa não existe mais (410)",
+        };
+      }
+
+      // 4xx (não 429/403/410) = não vale retry
+      if (status >= 400 && status < 500) {
+        return {
+          ok: false,
+          permanent: true,
+          statusCode: status,
+          errorMsg: err.message || `HTTP ${status}`,
+        };
+      }
+
+      // Erros não-HTTP ou esgotou retries → transitório (deixa SB redeliver)
+      return {
+        ok: false,
+        permanent: false,
+        statusCode: status,
+        errorMsg: err.message || String(err),
+      };
     }
   }
+  return { ok: false, permanent: false, errorMsg: "Max retries exceeded" };
 }
 
 async function processMessage(msg: ServiceBusReceivedMessage): Promise<void> {
   const body = msg.body as QueueMessage;
-  const { jobId, refJson, message } = body;
+  if (!body || !body.jobId || !body.refJson) {
+    console.error(`[WORKER] Mensagem inválida (sem jobId/refJson)`);
+    return; // autoComplete fará o complete
+  }
 
-  try {
-    const ref = JSON.parse(refJson) as ConversationReference;
-    await sendWithRetry(ref, message);
-    await incrementSent(jobId);
+  const ref = JSON.parse(body.refJson) as ConversationReference;
+  const message = await resolveMessage(body);
+
+  const outcome = await sendOnce(ref, message);
+
+  if (outcome.ok) {
+    await incrementSent(body.jobId);
     processedCount++;
-  } catch (err: any) {
-    errorCount++;
-    const errorMsg = err.statusCode === 403
-      ? "Usuário bloqueou/desinstalou o bot"
-      : err.message || String(err);
-    await incrementFailed(jobId, errorMsg);
-    console.error(`❌ ${errorMsg}`);
+    return;
+  }
 
-    // 403 = não faz retry, completar a mensagem
-    if (err.statusCode === 403) return;
+  errorCount++;
 
-    // Outros erros: throw para Service Bus fazer retry/dead-letter
-    throw err;
+  // Remove refs definitivamente inválidas para não estragar próximos disparos
+  if (outcome.statusCode === 403 || outcome.statusCode === 410) {
+    await removeRefByRowKey(body.rowKey).catch((err) =>
+      console.warn(`[WORKER] removeRefByRowKey: ${err.message || err}`)
+    );
+  }
+
+  await incrementFailed(body.jobId, outcome.errorMsg);
+  console.error(`❌ ${outcome.errorMsg}`);
+
+  if (!outcome.permanent) {
+    // Devolve para o Service Bus retentar / dead-letter conforme política da fila
+    throw new Error(outcome.errorMsg || "Transient error");
   }
 }
 
 async function processError(args: ProcessErrorArgs): Promise<void> {
   console.error(`[SERVICE BUS ERRO] ${args.error.message}`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 export async function startWorker(): Promise<void> {
@@ -114,7 +208,7 @@ export async function startWorker(): Promise<void> {
   console.log("=".repeat(50));
   console.log(`  Queue:        ${QUEUE_NAME}`);
   console.log(`  Concurrency:  ${MAX_CONCURRENT}`);
-  console.log(`  Bot App ID:   ${process.env.MICROSOFT_APP_ID?.substring(0, 8)}...`);
+  console.log(`  Bot App ID:   ${(process.env.MICROSOFT_APP_ID || "").substring(0, 8)}...`);
   console.log("=".repeat(50));
 
   const sbClient = new ServiceBusClient(SB_CONNECTION);
@@ -124,8 +218,8 @@ export async function startWorker(): Promise<void> {
 
   receiver.subscribe(
     {
-      processMessage: async (msg) => {
-        await processMessage(msg);
+      processMessage: async (m) => {
+        await processMessage(m);
       },
       processError,
     },
@@ -135,20 +229,18 @@ export async function startWorker(): Promise<void> {
     }
   );
 
-  // Log stats a cada 30s
   setInterval(logStats, 30000);
-
   console.log(`\n🚀 Worker iniciado, aguardando mensagens...\n`);
 
-  // Graceful shutdown
   const shutdown = async () => {
     console.log("\n🛑 Encerrando worker...");
     logStats();
-    await receiver.close();
-    await sbClient.close();
+    try {
+      await receiver.close();
+      await sbClient.close();
+    } catch {}
     process.exit(0);
   };
-
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 }

@@ -1,123 +1,184 @@
 // Copyright (c) 2026 Ednei Monteiro. Licensed under the MIT License.
 // See LICENSE and DISCLAIMER.md in the project root for details.
-import express, { Request, Response } from "express";
-import { BotFrameworkAdapter, TurnContext } from "botbuilder";
-import { ServiceBusClient } from "@azure/service-bus";
+//
+// API server (ACA, ingress externo). Responsabilidades:
+//  - /api/messages   → endpoint do Bot Framework (recebe eventos do Teams)
+//  - /api/send       → enfileira N mensagens no Service Bus (auth: x-api-key)
+//  - /api/jobs/:id   → progresso do job (Redis)
+//  - /api/status     → contagem de usuários registrados
+//  - /healthz        → liveness
+//  - /readyz         → readiness (Redis + Storage)
+
+import express, { NextFunction, Request, Response } from "express";
+import { BotFrameworkAdapter } from "botbuilder";
+import { ServiceBusClient, ServiceBusMessage } from "@azure/service-bus";
 import { v4 as uuidv4 } from "uuid";
+import { createHash } from "crypto";
+import * as dotenv from "dotenv";
+
 import { ProactiveBot } from "./bot";
 import {
-  saveRef, removeRef, getAllRefs, countRefs, ensureTables,
+  saveRef,
+  removeRef,
+  getAllRefs,
+  ensureTables,
+  pingStorage,
+  safeRowKey,
 } from "./table-store";
-import { createJob, getJob } from "./redis-tracker";
-import * as dotenv from "dotenv";
+import {
+  createJob,
+  getJob,
+  setJobStatus,
+  refsCount,
+  pingRedis,
+} from "./redis-tracker";
 
 dotenv.config();
 
-const PORT = process.env.PORT || 3978;
-const appId = process.env.MICROSOFT_APP_ID || "";
-const appPassword = process.env.MICROSOFT_APP_PASSWORD || "";
-const sbConnection = process.env.SERVICE_BUS_CONNECTION || "";
+const PORT = parseInt(process.env.PORT || "3978", 10);
+const APP_ID = process.env.MICROSOFT_APP_ID || "";
+const APP_PASSWORD = process.env.MICROSOFT_APP_PASSWORD || "";
+const APP_TENANT = process.env.MICROSOFT_APP_TENANT_ID || "";
+const SB_CONNECTION = process.env.SERVICE_BUS_CONNECTION || "";
+const QUEUE_NAME = process.env.QUEUE_NAME || "send-messages";
+const API_KEY = process.env.API_KEY || "";
 
-// BotFrameworkAdapter SingleTenant
+// --- Bot Framework ---
+
 const adapter = new BotFrameworkAdapter({
-  appId,
-  appPassword,
-  channelAuthTenant: process.env.MICROSOFT_APP_TENANT_ID || "",
+  appId: APP_ID,
+  appPassword: APP_PASSWORD,
+  channelAuthTenant: APP_TENANT,
 });
 
 adapter.onTurnError = async (context, error) => {
-  console.error(`[ERRO] ${error.message}`);
+  console.error(`[BOT ERRO] ${error.message}`);
+  // Só responde para mensagens reais; nunca em envios proativos.
   if (context.activity?.type === "message" && context.activity?.replyToId) {
     await context.sendActivity("Ocorreu um erro. Tente novamente.");
   }
 };
 
-// Bot que salva refs no Table Storage
 const bot = new ProactiveBot({
   save: async (ref) => {
-    const key = ref.conversation?.id;
-    if (!key) return;
-    await saveRef(key, JSON.stringify(ref));
-    console.log(`[BOT] Referência salva (Table Storage): ${key.substring(0, 30)}...`);
+    const id = ref.conversation?.id;
+    if (!id) return;
+    await saveRef(id, JSON.stringify(ref));
+    console.log(`[BOT] Ref salva: ${id.substring(0, 30)}...`);
   },
-  remove: async (conversationId) => {
-    await removeRef(conversationId);
-    console.log(`[BOT] Referência removida: ${conversationId.substring(0, 30)}...`);
+  remove: async (id) => {
+    await removeRef(id);
+    console.log(`[BOT] Ref removida: ${id.substring(0, 30)}...`);
   },
 });
 
-// Service Bus client
-const sbClient = sbConnection ? new ServiceBusClient(sbConnection) : null;
+// --- Service Bus ---
 
-const app2 = express();
-app2.use(express.json());
+const sbClient = SB_CONNECTION ? new ServiceBusClient(SB_CONNECTION) : null;
 
-// Endpoint do Bot Framework
-app2.post("/api/messages", async (req: Request, res: Response) => {
+// --- App ---
+
+const app = express();
+app.use(express.json({ limit: "256kb" }));
+
+// Bot Framework endpoint — auth via Bot Framework token, NÃO usa x-api-key.
+app.post("/api/messages", async (req: Request, res: Response) => {
   await adapter.processActivity(req, res, async (context) => {
     await bot.run(context);
   });
 });
 
-// ASYNC: Envia mensagens via Service Bus (retorna jobId imediato)
-app2.post("/api/send", async (req: Request, res: Response) => {
-  const { message } = req.body;
-  if (!message) {
-    return res.status(400).json({ error: "Campo 'message' é obrigatório" });
-  }
+// --- Auth middleware (apenas para endpoints administrativos) ---
 
+function requireApiKey(req: Request, res: Response, next: NextFunction): void {
+  if (!API_KEY) {
+    // Sem API_KEY configurada → modo dev local (logs warning ao iniciar).
+    return next();
+  }
+  const headerKey = req.header("x-api-key") || "";
+  if (headerKey !== API_KEY) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
+// --- POST /api/send (assíncrono) ---
+
+app.post("/api/send", requireApiKey, async (req: Request, res: Response) => {
+  const { message } = req.body || {};
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "Campo 'message' (string) é obrigatório" });
+  }
   if (!sbClient) {
-    return res.status(500).json({ error: "SERVICE_BUS_CONNECTION não configurada" });
+    return res.status(503).json({ error: "SERVICE_BUS_CONNECTION não configurada" });
   }
 
-  const refs = await getAllRefs();
+  let refs: { rowKey: string; refJson: string }[];
+  try {
+    refs = await getAllRefs();
+  } catch (err: any) {
+    console.error(`[SEND] Falha ao listar refs: ${err.message || err}`);
+    return res.status(503).json({ error: "Falha ao acessar Storage" });
+  }
+
   if (refs.length === 0) {
-    return res.status(404).json({
-      error: "Nenhum usuário registrado. O app precisa ser instalado primeiro.",
+    return res.status(409).json({
+      error: "Nenhum usuário registrado. Instale o Teams app primeiro.",
     });
   }
 
   const jobId = uuidv4();
   await createJob(jobId, message, refs.length);
 
-  // Enfileirar mensagens no Service Bus em batches de 250
-  const sender = sbClient.createSender("send-messages");
-  const QUEUE_BATCH = 250;
-  for (let i = 0; i < refs.length; i += QUEUE_BATCH) {
-    const batch = await sender.createMessageBatch();
-    for (const refJson of refs.slice(i, i + QUEUE_BATCH)) {
-      const added = batch.tryAddMessage({
-        body: { jobId, refJson, message },
+  const sender = sbClient.createSender(QUEUE_NAME);
+  let enqueued = 0;
+  try {
+    let batch = await sender.createMessageBatch();
+    for (const ref of refs) {
+      const sbMessage: ServiceBusMessage = {
+        body: { jobId, refJson: ref.refJson, rowKey: ref.rowKey },
         contentType: "application/json",
-      });
-      if (!added) {
-        // Batch cheio, enviar e criar novo
+        // Idempotência: ServiceBus Standard/Premium usam para deduplicar.
+        // Em Basic não tem efeito, mas é uma boa prática manter.
+        // SB limita messageId a 128 chars; usamos hash do rowKey (32 hex).
+        messageId: `${jobId}:${createHash("md5").update(ref.rowKey).digest("hex")}`,
+      };
+      if (!batch.tryAddMessage(sbMessage)) {
+        // Batch cheio → envia o atual e cria um novo
         await sender.sendMessages(batch);
-        const newBatch = await sender.createMessageBatch();
-        newBatch.tryAddMessage({
-          body: { jobId, refJson, message },
-          contentType: "application/json",
-        });
+        enqueued += batch.count;
+        batch = await sender.createMessageBatch();
+        if (!batch.tryAddMessage(sbMessage)) {
+          // Mensagem maior que o batch limit (não deveria acontecer)
+          console.warn(`[SEND] Mensagem ${ref.rowKey} excede limite do batch`);
+          continue;
+        }
       }
     }
     if (batch.count > 0) {
       await sender.sendMessages(batch);
+      enqueued += batch.count;
     }
+  } finally {
+    await sender.close().catch(() => {});
   }
-  await sender.close();
 
-  console.log(`🚀 Job ${jobId}: ${refs.length} mensagens enfileiradas`);
+  await setJobStatus(jobId, "processing");
+  console.log(`🚀 Job ${jobId}: ${enqueued}/${refs.length} mensagens enfileiradas`);
 
-  res.json({
+  res.status(202).json({
     jobId,
     total: refs.length,
+    enqueued,
     status: "queued",
     statusUrl: `/api/jobs/${jobId}`,
   });
 });
 
-// Consultar progresso do job
-app2.get("/api/jobs/:id", async (req: Request, res: Response) => {
+// --- GET /api/jobs/:id ---
+
+app.get("/api/jobs/:id", requireApiKey, async (req: Request, res: Response) => {
   const job = await getJob(req.params.id);
   if (!job) {
     return res.status(404).json({ error: "Job não encontrado" });
@@ -125,17 +186,49 @@ app2.get("/api/jobs/:id", async (req: Request, res: Response) => {
   res.json(job);
 });
 
-// Status geral
-app2.get("/api/status", async (_req: Request, res: Response) => {
-  const count = await countRefs();
-  res.json({ registeredUsers: count, status: "running", mode: "queue" });
+// --- GET /api/status ---
+
+app.get("/api/status", requireApiKey, async (_req: Request, res: Response) => {
+  const count = await refsCount();
+  res.json({
+    registeredUsers: count,
+    status: "running",
+    mode: "queue",
+    queue: QUEUE_NAME,
+  });
 });
 
-app2.listen(PORT, async () => {
+// --- Health probes ---
+
+app.get("/healthz", (_req: Request, res: Response) => {
+  res.json({ status: "ok", uptime: process.uptime() });
+});
+
+app.get("/readyz", async (_req: Request, res: Response) => {
+  const [redisOk, storageOk] = await Promise.all([pingRedis(), pingStorage()]);
+  const ok = redisOk && storageOk && !!sbClient;
+  res.status(ok ? 200 : 503).json({
+    redis: redisOk,
+    storage: storageOk,
+    serviceBus: !!sbClient,
+  });
+});
+
+// --- Bootstrap ---
+
+app.listen(PORT, async () => {
   await ensureTables();
-  console.log(`\n🤖 Bot rodando em http://localhost:${PORT}`);
-  console.log(`   POST /api/messages  → Endpoint do Bot Framework`);
-  console.log(`   POST /api/send      → Enfileira mensagens (retorna jobId)`);
-  console.log(`   GET  /api/jobs/:id  → Progresso do job`);
-  console.log(`   GET  /api/status    → Status e contagem de usuários\n`);
+  console.log("\n🤖 Teams Proactive Messaging API");
+  console.log(`   Listening on http://localhost:${PORT}`);
+  console.log(`   POST /api/messages   → Bot Framework endpoint`);
+  console.log(`   POST /api/send       → Enfileira mensagens (auth: x-api-key)`);
+  console.log(`   GET  /api/jobs/:id   → Progresso do job`);
+  console.log(`   GET  /api/status     → Contagem de usuários`);
+  console.log(`   GET  /healthz        → Liveness`);
+  console.log(`   GET  /readyz         → Readiness (Redis + Storage)`);
+  if (!API_KEY) {
+    console.warn("   ⚠️  API_KEY vazia: /api/send está SEM autenticação (modo dev).\n");
+  } else {
+    console.log("   🔒 API_KEY configurada\n");
+  }
 });
