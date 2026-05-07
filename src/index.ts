@@ -6,9 +6,9 @@ import { ServiceBusClient } from "@azure/service-bus";
 import { v4 as uuidv4 } from "uuid";
 import { ProactiveBot } from "./bot";
 import {
-  saveRef, removeRef, getAllRefs, countRefs,
-  createJob, getJob, ensureTables,
+  saveRef, removeRef, getAllRefs, countRefs, ensureTables,
 } from "./table-store";
+import { createJob, getJob } from "./redis-tracker";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -122,19 +122,7 @@ app2.get("/api/jobs/:id", async (req: Request, res: Response) => {
   if (!job) {
     return res.status(404).json({ error: "Job não encontrado" });
   }
-
-  const errors = JSON.parse(job.errors || "[]");
-  res.json({
-    jobId: job.rowKey,
-    status: job.status,
-    total: job.total,
-    sent: job.sent,
-    failed: job.failed,
-    progress: job.total > 0 ? Math.round(((job.sent + job.failed) / job.total) * 100) : 0,
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-    errors: errors.slice(0, 20),
-  });
+  res.json(job);
 });
 
 // Status geral

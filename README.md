@@ -240,11 +240,12 @@ flowchart TD
 | **Container Apps** | Consumption | API Server (minReplicas: 1, ingress externo) | ~US$ 5/mês |
 | **Container Apps** | Consumption | Workers KEDA (scale-to-zero, 0-10 réplicas) | Pay-per-use |
 | **Service Bus** | Basic | Fila de mensagens com dead-letter e retry | ~US$ 0,05/mês |
-| **Storage Account** | Standard LRS | Table Storage para refs e tracking de jobs | ~US$ 1/mês |
+| **Table Storage** | Standard LRS | Conversation references (durável, 50K+ docs) | ~US$ 0,01/mês |
+| **Azure Cache for Redis** | C0 (Basic) | Job counters atômicos (HINCRBY, sem race conditions) | ~US$ 16/mês |
 | **Container Registry** | Basic | Imagens Docker (API + worker) | ~US$ 5/mês |
 | **Log Analytics** | Pay-per-GB | Logs do ACA (configure daily cap) | ~US$ 2/mês |
 
-> 💡 **Custo total estimado**: ~US$ 13-15/mês em repouso. Workers geram custo apenas quando estão enviando. Tudo roda no mesmo ACA Environment.
+> 💡 **Custo total estimado**: ~US$ 28/mês. Workers geram custo apenas quando estão enviando. Tudo roda no mesmo ACA Environment.
 
 ---
 
@@ -561,26 +562,29 @@ graph LR
 
 ### Benchmarks de Performance
 
-Resultados obtidos em testes de carga com 1 worker (ACA, 0.5 vCPU, 1Gi):
+Resultados obtidos em testes de carga com 1 worker ACA (0.5 vCPU, 1Gi), Redis C0, Table Storage, Service Bus Basic:
 
-| Teste | Mensagens | Falhas | Throughput |
-|-------|-----------|--------|------------|
-| Síncrono | 1.000 | 0 | ~43 msg/min |
-| Assíncrono (Service Bus) | 100 | 0 | ~578 msg/min |
-| Assíncrono (Service Bus) | 1.000 | 0 | ~338 msg/min |
+| Refs | Total Msgs | Sent | Failed | Enqueue | Processing | Throughput |
+|------|-----------|------|--------|---------|-----------|------------|
+| 500 | 502 | 502 | 0 | 0.9s | 50.7s | 595 msg/min ¹ |
+| 1.000 | 1.002 | 1.002 | 0 | 0.7s | 3.2s | 18.953 msg/min |
+| 10.000 | 10.002 | 10.002 | 0 | 16.5s | 12.9s | 46.481 msg/min |
+| 15.000 | 15.002 | 15.002 | 0 | 13.2s | 57.5s | 15.654 msg/min ¹ |
+| **50.000** | **50.002** | **50.002** | **0** | **45.3s** | **96.9s** | **30.976 msg/min** |
 
-Projeção teórica de escalabilidade com múltiplos workers:
-
-| Workers | Throughput estimado |
-|---------|-------------------|
-| 1 | ~350 msg/min |
-| 3 | ~1.000 msg/min |
-| 5 | ~1.700 msg/min |
-| 10 | ~3.000 msg/min |
-
-> ⚠️ **Limite do Bot Framework**: ~50 msg/s por bot antes de throttling pesado. Com 10 workers a ~50 msg/s no total, você fica dentro dos limites seguros.
+> ¹ Throughput menor nas waves 500 e 15K devido ao cold start do KEDA (scale-to-zero → primeiro container demora ~45s para iniciar).
 >
-> 📌 As projeções para múltiplos workers são teóricas e devem ser validadas com testes de carga no seu ambiente.
+> 📌 Com o worker já "quente" (réplica ativa), o throughput sustentado fica entre **15.000–46.000 msg/min** dependendo da carga.
+
+### Como os números se traduzem na prática
+
+| Usuários | Enqueue | Processamento | Total |
+|----------|---------|--------------|-------|
+| 1.000 | ~1s | ~3s | **~4s** |
+| 10.000 | ~17s | ~13s | **~30s** |
+| 50.000 | ~45s | ~97s | **~2.5 min** |
+
+> ⚠️ **Limite do Bot Framework**: ~50 msg/s por bot antes de throttling pesado. Com múltiplos workers o throughput pode ser maior, mas o Bot Service é o gargalo final.
 
 ### Variáveis de Configuração
 

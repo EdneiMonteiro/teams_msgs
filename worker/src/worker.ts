@@ -2,7 +2,7 @@
 // See LICENSE and DISCLAIMER.md in the project root for details.
 import { ServiceBusClient, ServiceBusReceivedMessage, ProcessErrorArgs } from "@azure/service-bus";
 import { BotFrameworkAdapter, ConversationReference, TurnContext } from "botbuilder";
-import { incrementJobProgress } from "./job-tracker";
+import { incrementSent, incrementFailed } from "./redis-tracker";
 
 interface QueueMessage {
   jobId: string;
@@ -77,14 +77,14 @@ async function processMessage(msg: ServiceBusReceivedMessage): Promise<void> {
   try {
     const ref = JSON.parse(refJson) as ConversationReference;
     await sendWithRetry(ref, message);
-    await incrementJobProgress(jobId, true);
+    await incrementSent(jobId);
     processedCount++;
   } catch (err: any) {
     errorCount++;
     const errorMsg = err.statusCode === 403
       ? "Usuário bloqueou/desinstalou o bot"
       : err.message || String(err);
-    await incrementJobProgress(jobId, false, errorMsg);
+    await incrementFailed(jobId, errorMsg);
     console.error(`❌ ${errorMsg}`);
 
     // 403 = não faz retry, completar a mensagem
