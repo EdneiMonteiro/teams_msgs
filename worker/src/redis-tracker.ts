@@ -27,23 +27,24 @@ export function getRedis(): Redis {
 }
 
 const REFS_SET = "refs:active";
+const RATE_BUCKET_KEY = process.env.RATE_LIMIT_KEY || "ratelimit:bot";
+
 function jobKey(jobId: string): string {
   return `job:${jobId}`;
 }
 
-export async function getJobMessage(jobId: string): Promise<string | null> {
-  const msg = await getRedis().hget(jobKey(jobId), "message");
-  return msg;
+export type MessageType = "text" | "card";
+
+export interface ResolvedMessage {
+  type: MessageType;
+  serialized: string;
 }
 
-export async function getJobTotals(jobId: string): Promise<{ total: number; sent: number; failed: number } | null> {
-  const data = await getRedis().hmget(jobKey(jobId), "total", "sent", "failed");
+export async function getJobMessage(jobId: string): Promise<ResolvedMessage | null> {
+  const data = await getRedis().hmget(jobKey(jobId), "message", "messageType");
   if (!data[0]) return null;
-  return {
-    total: parseInt(data[0] || "0", 10),
-    sent: parseInt(data[1] || "0", 10),
-    failed: parseInt(data[2] || "0", 10),
-  };
+  const type = (data[1] as MessageType) || "text";
+  return { type, serialized: data[0] };
 }
 
 export async function incrementSent(jobId: string): Promise<void> {
@@ -86,4 +87,73 @@ export async function incrementFailed(jobId: string, errorMsg?: string): Promise
 
 export async function refsRemove(rowKey: string): Promise<void> {
   await getRedis().srem(REFS_SET, rowKey);
+}
+
+// --- Token Bucket (idêntico ao da API) ---
+
+export const TOKEN_BUCKET_LUA = `
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])
+local now_ms   = tonumber(ARGV[3])
+
+local data = redis.call("HMGET", KEYS[1], "tokens", "ts")
+local tokens = tonumber(data[1])
+local last   = tonumber(data[2])
+
+if tokens == nil then tokens = capacity end
+if last   == nil then last   = now_ms end
+
+local elapsed = math.max(0, now_ms - last) / 1000.0
+tokens = math.min(capacity, tokens + elapsed * rate)
+
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", now_ms)
+redis.call("EXPIRE", KEYS[1], 60)
+return allowed
+`;
+
+let bucketScriptLoaded = false;
+async function ensureBucketScript(): Promise<void> {
+  if (bucketScriptLoaded) return;
+  const redis = getRedis();
+  if (!(redis as any).acquireBucketToken) {
+    redis.defineCommand("acquireBucketToken", {
+      numberOfKeys: 1,
+      lua: TOKEN_BUCKET_LUA,
+    });
+  }
+  bucketScriptLoaded = true;
+}
+
+export async function tryAcquireToken(): Promise<boolean> {
+  await ensureBucketScript();
+  const cap = parseInt(process.env.RATE_LIMIT_CAPACITY || "50", 10);
+  const rate = parseInt(process.env.RATE_LIMIT_PER_SEC || "50", 10);
+  const result = await (getRedis() as any).acquireBucketToken(
+    RATE_BUCKET_KEY,
+    cap,
+    rate,
+    Date.now()
+  );
+  return Number(result) === 1;
+}
+
+/**
+ * Acquire 1 token, sleeping with backoff+jitter until granted.
+ * Used by worker before each Bot Framework call.
+ */
+export async function acquireToken(): Promise<void> {
+  let attempt = 0;
+  while (true) {
+    if (await tryAcquireToken()) return;
+    attempt++;
+    const base = Math.min(20 + attempt * 5, 250);
+    const jitter = Math.floor(Math.random() * 50);
+    await new Promise((r) => setTimeout(r, base + jitter));
+  }
 }

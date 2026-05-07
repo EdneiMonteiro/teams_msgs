@@ -180,6 +180,9 @@ flowchart TD
 
 ### `POST /api/send`
 
+Aceita **texto** ou **Adaptive Card**.
+
+**Texto:**
 ```http
 POST /api/send
 Content-Type: application/json
@@ -191,10 +194,34 @@ x-api-key: <API_KEY>
 }
 ```
 
+**Adaptive Card:**
+```http
+POST /api/send
+Content-Type: application/json
+x-api-key: <API_KEY>
+
+{
+  "message": {
+    "type": "AdaptiveCard",
+    "content": {
+      "type": "AdaptiveCard",
+      "version": "1.5",
+      "body": [
+        { "type": "TextBlock", "size": "Medium", "weight": "Bolder", "text": "Atualização" },
+        { "type": "TextBlock", "text": "Conteúdo da mensagem.", "wrap": true }
+      ],
+      "actions": [
+        { "type": "Action.OpenUrl", "title": "Saiba mais", "url": "https://exemplo.com" }
+      ]
+    }
+  }
+}
+```
+
 | Campo | Tipo | Obrigatório | Descrição |
 |---|---|---|---|
-| `message` | string | sim | Texto enviado a cada usuário |
-| `repeat` | int | não | Cópias por usuário (default `1`, máx `100000`). Útil para testes de stress / broadcast em rajada |
+| `message` | string \| object | sim | Texto OU `{ type:"AdaptiveCard", content:<card json> }` |
+| `repeat` | int | não | Cópias por usuário (default `1`, máx `100000`). Útil para testes de stress |
 
 ```json
 HTTP/1.1 202 Accepted
@@ -204,6 +231,8 @@ HTTP/1.1 202 Accepted
   "repeat": 1,
   "total": 50000,
   "enqueued": 50000,
+  "drops": 0,
+  "messageType": "text",
   "status": "queued",
   "statusUrl": "/api/jobs/d836..."
 }
@@ -382,22 +411,22 @@ az containerapp create -g $RG -n worker-teams-msgs \
 
 ## Benchmarks
 
-Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic. Cada job dispara N mensagens 1:1 a partir de 1 POST.
+Medidos em ambiente real: 1–10 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic. Cada job dispara N mensagens 1:1 a partir de 1 POST.
 
-### Resultado de referência — single-job 50K (versão atual, v7)
+### Resultado de referência — single-job 50K (versão atual, v8 com rate limit)
 
 | Métrica | Valor |
 |---|---|
 | Total de mensagens | **50.002** |
 | Enviadas | **50.002** (100%) |
 | Falhas | **0** |
-| Tempo de enqueue (Service Bus) | **63.8s** |
-| Tempo de processamento | **80.9s** |
-| Tempo total | **144.6s** (~2 min 25 s) |
-| **Throughput sustentado** | **37.089 msg/min** (~618 msg/s) |
+| Tempo de enqueue (Service Bus) | **41.6s** |
+| Tempo de processamento | **734.3s** (~12 min 14 s) |
+| Tempo total | **775.9s** (~13 min) |
+| **Throughput sustentado** | **4.086 msg/min** (~68 msg/s) |
+| Rate limit configurado | `RATE_LIMIT_PER_SEC=50` (= teto teórico 3.000 msg/min) |
 
-> Relatório bruto: `load_test/report-50k.json`. Reproduza com:
-> `node load_test/run-50k.js --refs 50000` (precisa de `BOT_URL`, `API_KEY` e `STORAGE_CONNECTION` no env).
+> ⚠️ A v8 introduz **token bucket global no Redis**. O throughput agora é **deliberadamente limitado** ao patamar configurado em `RATE_LIMIT_PER_SEC`, que é o limite efetivo do Bot Framework. Em demos sem rate limit (v6/v7), o throughput chegava a 30–40k msg/min — mas em produção o Bot Framework rejeita essa carga com 429.
 
 ### Histórico de evolução (mesmo cenário — 50K refs)
 
@@ -406,9 +435,10 @@ Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table St
 | v1 (POC) | Cosmos DB + ETag retries | — | travado em 71% | Race condition em writes concorrentes |
 | v3 | Redis (counters) + Table Storage (refs/jobs) | 30.976 msg/min | 0 | Job tracking no Redis resolve race condition |
 | v6 | Redis (counters + refs index + msg cache) + Table Storage (refs only) | 42.821 msg/min | 0 | Mensagem cacheada no Redis, payload SB menor, hash do messageId |
-| **v7 (atual)** | Param `repeat` no `/api/send` para broadcast em rajada | **37.089 msg/min** | **0** | Variância natural entre runs (Bot Framework + SB Basic compartilhados) |
+| v7 | Param `repeat` no `/api/send` | 37.089 msg/min | 0 | Variância natural ~13% (Bot Framework + SB Basic compartilhados) |
+| **v8 (atual)** | **Streaming + Adaptive Cards + Token Bucket Redis + testes Jest** | **4.086 msg/min** | **0** | Throughput limitado por design (RATE_LIMIT_PER_SEC=50) — protege Bot Framework de 429 |
 
-### Waves (volume crescente)
+### Sem rate limit (workload "nu", v6/v7)
 
 | Refs | Total Msgs | Sent | Failed | Enqueue | Processing | Throughput |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -419,10 +449,10 @@ Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table St
 
 ¹ Throughput menor por cold start do KEDA (scale-to-zero → primeiro container demora ~45s para subir).
 
-> 📌 Os números usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out, fila, autoscale, job tracking e remoção de refs inválidas — mas **não exercitam o Bot Framework com 50k usuários distintos**. Em cenário real:
-> - **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot, ~3.000 msg/min)
+> 📌 Os números usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out, fila, autoscale, job tracking e remoção de refs inválidas. Em produção, o **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot, ~3.000 msg/min):
 > - 100k mensagens em ~30–40 minutos com 1 bot
 > - Para janelas mais agressivas, paralelizar com múltiplos bots por audiência
+> - **Recomendação**: manter `RATE_LIMIT_PER_SEC=50` (default) e ajustar conforme sua negociação com Microsoft
 
 ---
 
@@ -430,15 +460,20 @@ Medidos em ambiente real: 1 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table St
 
 Items que fariam sentido em uma evolução para produção:
 
-- **Token bucket global no Redis** — limita o envio agregado por bot/tenant, independente do número de workers (KEDA escala compute, mas o teto real é o Bot Framework).
 - **Backpressure adaptativo** — reduzir concorrência por worker quando 429s aparecerem; aumentar quando 200s sustentados.
 - **Segmentação de audiência** — `POST /api/send` com filtro (lista CSV, departamento, país, tags).
-- **Adaptive Cards** — aceitar `message` como string OU `{type, content}` para Adaptive Card.
 - **Idempotência forte** — Service Bus Standard/Premium com duplicate detection (já populamos `messageId`).
 - **Reconciliação Redis ↔ Table** — job periódico para sincronizar `refs:active` SET com a tabela.
 - **Particionamento das refs** — distribuir entre múltiplas partitions por hash, evitando hot partition em Table Storage.
 - **Auditoria + governança** — modelo de "campanha" com owner, aprovação, dry-run, histórico.
 - **OIDC / Entra ID** — substituir `x-api-key` por validação de JWT.
+- **Logs estruturados + métricas** — pino/winston JSON, OpenTelemetry, métricas Prometheus customizadas.
+
+✅ **Implementado em v8 (2026-05):**
+- Token bucket global no Redis (RATE_LIMIT_PER_SEC / RATE_LIMIT_CAPACITY)
+- Adaptive Cards no `/api/send` (text OU `{type:"AdaptiveCard", content:...}`)
+- Streaming refs + parallel batch flushing (até 5 batches em vôo)
+- Suite de testes Jest (`npm test`) cobrindo retry/rate limit/validação
 
 ---
 

@@ -88,6 +88,20 @@ export async function getAllRefs(): Promise<{ rowKey: string; refJson: string }[
   return refs;
 }
 
+/**
+ * Streaming version — yields refs one by one without materializing the
+ * full list in memory. Recommended for large audiences (>10k).
+ */
+export async function* streamRefs(): AsyncGenerator<{ rowKey: string; refJson: string }> {
+  await ensureTables();
+  const iter = getClient().listEntities<ConversationRef>({
+    queryOptions: { filter: `PartitionKey eq '${PARTITION}'` },
+  });
+  for await (const entity of iter) {
+    yield { rowKey: entity.rowKey, refJson: entity.refJson };
+  }
+}
+
 export async function countRefsFromTable(): Promise<number> {
   // Usado apenas como fallback (ex.: reconciliação). O caminho rápido é
   // refsCount() do redis-tracker, baseado em SCARD.
