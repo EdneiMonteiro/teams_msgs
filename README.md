@@ -48,9 +48,6 @@ Esta demo **não burla rate limits** — usa o canal certo. O envio depende do T
 - [Como iniciar (dev local)](#como-iniciar-dev-local)
 - [Deploy em Azure](#deploy-em-azure)
 - [Deploy do Teams App](#deploy-do-teams-app)
-- [Benchmarks](#benchmarks)
-- [Decisões de arquitetura (ADR resumido)](#decisões-de-arquitetura-adr-resumido)
-- [Roadmap](#roadmap)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -61,7 +58,7 @@ Esta demo **não burla rate limits** — usa o canal certo. O envio depende do T
 
 ```mermaid
 graph LR
-    Client[Aplicação Cliente]
+    Client[Aplicação chamadora]
     subgraph "ACA Environment: aca-teams-msgs"
         API[API ACA<br/>api-teams-msgs<br/>min=1, ingress externo]
         W1[Worker ACA<br/>worker-teams-msgs<br/>0..10 réplicas KEDA]
@@ -183,7 +180,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Client as App cliente
+    participant Client as App chamadora
     participant API as API ACA
     participant Table as Table Storage
     participant Redis as Redis
@@ -402,7 +399,7 @@ graph TB
 - `POST /api/send`, `GET /api/jobs/:id`, `GET /api/status` exigem header `x-api-key` quando `API_KEY` está definida.
 - Comparação com `crypto.timingSafeEqual` (não vulnerável a timing attacks).
 - Em **dev local**, deixar `API_KEY` vazia desliga a checagem (a API loga um warning ao iniciar).
-- Em **produção / cliente**, considere alternativas mais robustas (em ordem de robustez):
+- Em **produção**, considere alternativas mais robustas (em ordem de robustez):
   - Entra ID com client credentials + JWT bearer + middleware de validação;
   - APIM como front-door com policies;
   - ACA com ingress interno + APIM/AGW público;
@@ -574,7 +571,7 @@ az containerapp create -g $RG -n worker-teams-msgs \
   --scale-rule-auth connection=sb-conn
 ```
 
-> O ambiente de demonstração validado usa `teams-msgs-api:v8` e `teams-msgs-worker:v6`. Para novos clientes, mantenha tags explícitas por release e evite depender apenas de `latest`.
+> O ambiente de demonstração validado usa `teams-msgs-api:v8` e `teams-msgs-worker:v6`. Para novos ambientes, mantenha tags explícitas por release e evite depender apenas de `latest`.
 
 ---
 
@@ -585,109 +582,6 @@ az containerapp create -g $RG -n worker-teams-msgs \
 3. Suba em **Teams Admin Center → Manage apps → Upload new app**.
 4. **Setup policies → Global → Installed apps → Add apps** (org-wide).
 5. Propagação org-wide leva 24–48h. Para testes imediatos, instale manualmente em **Apps → Built for your org**.
-
----
-
-## Benchmarks
-
-Medidos em ambiente real: 1–10 worker ACA (0.5 vCPU, 1Gi), Redis C0 Basic, Table Storage LRS, Service Bus Basic. Cada job dispara N mensagens 1:1 a partir de 1 POST.
-
-### Resultado de referência — single-job 50K (versão atual, v8 com rate limit)
-
-| Métrica | Valor |
-|---|---|
-| Total de mensagens | **50.002** |
-| Enviadas | **50.002** (100%) |
-| Falhas | **0** |
-| Tempo de enqueue (Service Bus) | **41.6s** |
-| Tempo de processamento | **734.3s** (~12 min 14 s) |
-| Tempo total | **775.9s** (~13 min) |
-| **Throughput observado pelo script de load** | **4.086 msg/min** (~68 msg/s, janela de processamento medida pelo cliente) |
-| Rate limit configurado | `RATE_LIMIT_PER_SEC=50` (teto teórico ~3.000 msg/min) |
-
-> ⚠️ A v8 introduz **token bucket global no Redis**. O throughput agora é **deliberadamente limitado** pelo `RATE_LIMIT_PER_SEC`, que deve ser ajustado ao limite efetivo do Bot Framework no tenant do cliente. O número acima é a métrica observada pelo script de load na janela de processamento do job; não substitui telemetria operacional do bucket/token ou do Bot Framework. Em demos sem rate limit (v6/v7), o throughput chegava a 30–40k msg/min — mas em produção o Bot Framework rejeitaria essa carga com 429 em cascata.
-
-### Histórico de evolução (mesmo cenário — 50K refs)
-
-| Versão | Mudança principal | Throughput | Falhas | Observação |
-|---|---|---:|---:|---|
-| v1 (POC) | Cosmos DB + ETag retries | — | travado em 71% | Race condition em writes concorrentes |
-| v3 | Redis (counters) + Table Storage (refs/jobs) | 30.976 msg/min | 0 | Job tracking no Redis resolve race condition |
-| v6 | Redis (counters + refs index + msg cache) + Table Storage (refs only) | 42.821 msg/min | 0 | Mensagem cacheada no Redis, payload SB menor |
-| v7 | Param `repeat` no `/api/send` | 37.089 msg/min | 0 | Variância natural ~13% (Bot Framework + SB Basic compartilhados) |
-| **v8 (atual)** | **Streaming + Adaptive Cards + Token Bucket Redis + Jest** | **4.086 msg/min** | **0** | Observado pelo script de load; protegido por token bucket |
-
-**Visualização do throughput sustentado por versão:**
-
-```
-v1   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  TRAVADO @ 71%
-v3   ████████████████████░░░░░░░░░░░░░░░░░░░░  30.976 msg/min
-v6   ████████████████████████████░░░░░░░░░░░░  42.821 msg/min  ← teto sem rate limit
-v7   █████████████████████████░░░░░░░░░░░░░░░  37.089 msg/min
-v8   ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   4.086 msg/min  ← observado com RATE_LIMIT_PER_SEC=50
-```
-
-### Sem rate limit (workload "nu", v6/v7)
-
-| Refs | Total Msgs | Sent | Failed | Enqueue | Processing | Throughput |
-|---:|---:|---:|---:|---:|---:|---:|
-| 500 | 502 | 502 | 0 | 0.9s | 50.7s | 595 msg/min ¹ |
-| 1.000 | 1.002 | 1.002 | 0 | 0.7s | 3.2s | 18.953 msg/min |
-| 10.000 | 10.002 | 10.002 | 0 | 16.5s | 12.9s | 46.481 msg/min |
-| 15.000 | 15.002 | 15.002 | 0 | 13.2s | 57.5s | 15.654 msg/min ¹ |
-
-¹ Throughput menor por cold start do KEDA (scale-to-zero → primeiro container demora ~45s para subir).
-
-> 📌 Os números usam **fake refs** (clones de uma ref real), que validam o caminho de fan-out, fila, autoscale, job tracking e remoção de refs inválidas. Em produção:
-> - **Bot Framework é o gargalo final** (~50 msg/s sustentado por bot, ~3.000 msg/min)
-> - 100k mensagens em ~30–40 minutos com 1 bot
-> - Para janelas mais agressivas, paralelizar com múltiplos bots por audiência
-> - **Recomendação**: manter `RATE_LIMIT_PER_SEC=50` (default) e ajustar conforme sua negociação com Microsoft
-
----
-
-## Decisões de arquitetura (ADR resumido)
-
-| Decisão | Por quê |
-|---|---|
-| **SingleTenant bot** | MultiTenant foi descontinuado no Azure Bot (mai/2026). UserAssignedMSI é mais complexo sem benefício para o caso de uso. |
-| **ACA em vez de Functions** | Functions com B1 plan dá timeout de startup com node_modules grande. ACA + KEDA tem melhor ergonomia para workloads queue-driven longos. |
-| **Redis para counters** | Cosmos DB com ETag travava em ~71% num cenário de 50K writes concorrentes ao mesmo doc. `HINCRBY` no Redis é atomic e O(1). |
-| **Table Storage para refs** | Cheap (~$0.01/mês), durável, write-rare-read-bulk, sem hot partition para 100k+. |
-| **Service Bus Basic** | Suficiente para queue + dead-letter. Standard só vale se precisar duplicate detection nativo. |
-| **Token bucket no Redis (Lua)** | Único ponto de coordenação atomic entre N réplicas; fica naturalmente onde counters e msg cache já estão. |
-| **Streaming refs** | Para 100k+ refs, materializar array em memória dá OOM. Generator yield + parallel flush = O(1) memory. |
-| **Adaptive Cards via union type** | Mantém retrocompatibilidade. Cards grandes ainda cabem no SB (256KB Basic). |
-
----
-
-## Roadmap
-
-Implementado em **v8** (esta versão):
-- ✅ Token bucket global no Redis (RATE_LIMIT_PER_SEC / RATE_LIMIT_CAPACITY)
-- ✅ Adaptive Cards no `/api/send`
-- ✅ Streaming refs + parallel batch flushing
-- ✅ Suite de testes Jest (`npm test`)
-- ✅ `timingSafeEqual` no comparador de API_KEY
-- ✅ Drop tracking (mensagens > 256KB → `incrementFailed`)
-
-Não implementado (próximas evoluções):
-
-- **Backpressure adaptativo** — reduzir concorrência por worker quando 429s aparecerem; aumentar quando 200s sustentados.
-- **Segmentação de audiência** — `POST /api/send` com filtro (lista CSV, departamento, país, tags).
-- **Idempotência forte** — Service Bus Standard/Premium com duplicate detection (`messageId` já populado).
-- **Reconciliação periódica Redis ↔ Table** — job timer para sincronizar `refs:active` SET com a tabela.
-- **Producer assíncrono para fan-out** — responder `202` imediatamente e enfileirar refs fora da requisição HTTP.
-- **Validação avançada de Adaptive Cards** — validar schema/tamanho antes de criar jobs massivos.
-- **Particionamento das refs** — distribuir entre múltiplas partitions por hash, evitando hot partition.
-- **Auditoria + governança** — modelo de "campanha" com owner, aprovação, dry-run, histórico.
-- **OIDC / Entra ID** — substituir `x-api-key` por validação de JWT.
-- **Logs estruturados + métricas** — pino/winston JSON, OpenTelemetry, métricas Prometheus customizadas.
-- **Métricas do token bucket** — observar tokens concedidos/negados e taxa efetiva por janela.
-- **Cancelamento de job** (`POST /api/jobs/:id/cancel`) — útil para abortar broadcast em curso.
-- **Webhook de conclusão** — POST callback ao cliente quando job termina.
-
----
 
 ## Troubleshooting
 
